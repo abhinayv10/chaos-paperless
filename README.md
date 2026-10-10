@@ -79,7 +79,23 @@ CLI `run`.
 
 ### AI-driven loop
 
-The same steps are on the dashboard's **AI Planner** and **Findings** tabs.
+The dashboard (http://127.0.0.1:8800) shows the same loop in three sections:
+
+- **Overview**: a headline status (Ready, Running, Fault active, Recovering, Recovered, Failed, Blocked) with one
+  sentence saying what happened, the resilience score, and a five-step strip for the current or latest experiment:
+  baseline, fault injected, impact observed, rolled back, recovered. Below it are the dependency map, the effect on
+  each user workflow before, during and after the fault, and the response-time chart.
+- **Experiments**: the same five-step strip, then the ranked plan with what each experiment is expected to affect
+  and why it has that rank, one button to approve and run the selected ones, and each completed experiment's
+  impact, severity and recovery. Run history and the manual experiment form are in collapsed sections below.
+- **Findings**: the score with its three components, a worst-first table of the weaknesses found, and one card per
+  weakness: what broke (measured), the likely cause, and the recommended fix, with the evidence one click away.
+
+The dashboard uses plain names: `db` is shown as "database", `broker` as "message broker", and the probes as the
+workflows they stand for ("List documents" for `api_documents`, and so on).
+
+"Recovered" is shown only once the controller has verified recovery. Output from the rules fallback is labelled as
+rule-based, with a notice on the plan and on the findings, and the top bar shows whether an LLM is configured.
 
 ```powershell
 .venv\Scripts\python -m chaos plan                  # Agent 1: ranked experiments with hypothesis and reasons
@@ -93,7 +109,7 @@ The same steps are on the dashboard's **AI Planner** and **Findings** tabs.
 .venv\Scripts\python -m chaos retest <run_id>       # after you apply a fix: same config again, then a comparison
 ```
 
-Running `plan-run` (or clicking **Approve & run selected** in the dashboard) is the human approval step. Nothing the
+Running `plan-run` (or clicking **Approve & run selected** on the Experiments tab) is the human approval step. Nothing the
 planner proposes starts by itself.
 
 ### AI provider

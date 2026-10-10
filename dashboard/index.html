@@ -10,24 +10,21 @@
 <header class="topbar">
   <div class="brand">
     <strong>Paperless Chaos Lab</strong>
-    <span class="muted">AI-driven chaos engineering · sandbox <code>paperless-chaos</code></span>
+    <span class="muted small">AI-driven chaos engineering</span>
   </div>
   <nav class="tabs" role="tablist">
-    <button data-tab="overview" class="active">Overview</button>
-    <button data-tab="graph">Dependency Map</button>
-    <button data-tab="plan">AI Planner</button>
-    <button data-tab="lab">Experiment Lab</button>
-    <button data-tab="obs">Observability</button>
-    <button data-tab="findings">Findings</button>
+    <button data-tab="overview" class="active"><b>1</b> Overview</button>
+    <button data-tab="experiments"><b>2</b> Experiments</button>
+    <button data-tab="findings"><b>3</b> Findings</button>
   </nav>
   <div class="topstate">
     <span id="conn" class="pill">connecting…</span>
-    <span id="top-exp" class="pill">idle</span>
+    <span id="ai-pill" class="pill">planner: …</span>
     <button id="kill" class="kill" title="Abort any running experiment and remove every fault now">■ KILL SWITCH</button>
   </div>
 </header>
 <div id="blocked-banner" class="banner critical" hidden>
-  <span>⛔ <strong>Experiments blocked:</strong> <span id="blocked-reason"></span></span>
+  <span><strong>Experiments blocked:</strong> <span id="blocked-reason"></span></span>
   <button id="unblock">Verify environment &amp; unblock</button>
 </div>
 <div id="toast" class="toast" hidden></div>
@@ -35,233 +32,149 @@
 <main>
   <!-- ======================================================== OVERVIEW -->
   <section id="tab-overview" class="tab active">
-    <div class="grid cols-4">
-      <div class="card stat" id="ov-app"><h3>Application</h3><div class="big">–</div><div class="sub"></div></div>
-      <div class="card stat" id="ov-deps"><h3>Dependencies</h3><div class="big">–</div><div class="sub"></div></div>
-      <div class="card stat" id="ov-exp"><h3>Current experiment</h3><div class="big">–</div><div class="sub"></div></div>
-      <div class="card stat" id="ov-safety"><h3>Safety controller</h3><div class="big">–</div><div class="sub"></div></div>
+    <div class="card hero">
+      <div class="hero-main">
+        <div id="hero-status" class="hero-status">–</div>
+        <p id="hero-text" class="hero-text"></p>
+        <div id="hero-health" class="hero-health"></div>
+      </div>
+      <div class="hero-score">
+        <div class="label">Resilience score</div>
+        <div id="hero-score" class="value">–</div>
+        <div id="hero-cov" class="small muted"></div>
+        <button id="hero-cta" class="primary" data-go="experiments">Run an experiment →</button>
+      </div>
     </div>
-    <div class="grid cols-2">
+
+    <div class="card">
+      <h2 id="story-title">What happened</h2>
+      <ol class="story" id="story-ov"></ol>
+    </div>
+
+    <div class="grid split">
       <div class="card">
-        <h2>Services <span class="muted small" id="ov-svc-ts"></span></h2>
-        <table class="tbl" id="ov-services"><thead><tr><th>Service</th><th>State</th><th>Health</th><th>Container</th></tr></thead><tbody></tbody></table>
-        <h2 class="mt">Live application probes</h2>
-        <table class="tbl" id="ov-probes"><thead><tr><th>Probe</th><th>Result</th><th>Latency</th><th>Detail</th></tr></thead><tbody></tbody></table>
+        <h2>What the application depends on <span class="muted small" id="ov-graph-note"></span></h2>
+        <div id="ov-graph" class="graph"></div>
+        <h2 class="mt">Effect on each user workflow</h2>
+        <div id="wf-ov"></div>
       </div>
       <div class="card">
-        <div class="row between">
-          <h2>Baseline <span class="muted small" id="ov-base-ts"></span></h2>
-          <div class="row">
-            <label class="small">duration <input id="base-dur" type="number" min="10" max="300" value="30" class="w60">s</label>
-            <button id="run-baseline">Run baseline workload</button>
-          </div>
+        <h2>Response time during the experiment <span class="muted small">hover for values</span></h2>
+        <div class="legend small" id="lg-ov"></div>
+        <div id="chart-ov" class="chart"></div>
+        <details><summary class="small muted">Event log</summary>
+          <div class="scroll log"><table class="tbl" id="ov-log"><tbody></tbody></table></div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================== EXPERIMENTS -->
+  <section id="tab-experiments" class="tab">
+    <div class="card">
+      <div class="row between">
+        <h2 id="now-title">Current experiment</h2>
+        <span id="now-status"></span>
+      </div>
+      <ol class="story compact" id="story-ex"></ol>
+    </div>
+
+    <div class="card">
+      <div class="row between">
+        <div>
+          <h2>Experiment plan, ranked by priority</h2>
+          <div class="small muted" id="pl-source"></div>
         </div>
-        <p class="muted small">Workload <span id="wl-desc"></span></p>
-        <table class="tbl" id="ov-baseline"><thead><tr><th>Probe</th><th>n</th><th>Error rate</th><th>p50</th><th>p95</th></tr></thead><tbody></tbody></table>
-        <div id="ov-base-empty" class="empty" hidden>No completed baseline yet. Run one before experimenting.</div>
+        <button id="pl-generate">Generate new plan</button>
+      </div>
+      <div id="pl-notice" class="note" hidden></div>
+      <div id="pl-empty" class="empty" hidden>No plan yet. Click “Generate new plan” to get ranked experiments.</div>
+      <div id="pl-recs" class="plan"></div>
+      <div id="pl-rejected" class="banner warning" hidden></div>
+      <div class="row mt" style="align-items:center">
+        <button id="pl-run" class="primary big">Approve &amp; run selected</button>
+        <span class="small muted" id="pl-seq"></span>
       </div>
     </div>
-    <div class="card">
-      <h2>Monitor: last 15 minutes <span class="muted small">(always-on probes, every 5s)</span></h2>
-      <div id="ov-monitor-chart" class="chart"></div>
-    </div>
-    <div class="card">
-      <h2>Safety events</h2>
-      <table class="tbl" id="ov-events"><thead><tr><th>Time</th><th>Event</th><th>Run</th><th>Message</th></tr></thead><tbody></tbody></table>
-    </div>
-  </section>
 
-  <!-- ======================================================== GRAPH -->
-  <section id="tab-graph" class="tab">
-    <div class="card">
-      <div class="row between">
-        <h2>Dependency map <span class="muted small" id="g-src"></span></h2>
-        <button id="g-refresh">Re-discover</button>
-      </div>
-      <div class="legend small" id="g-legend"></div>
-      <div id="g-svg" class="graph"></div>
-      <div id="g-error" class="banner warning" hidden></div>
-    </div>
-    <div class="grid cols-2">
-      <div class="card">
-        <h2>Edges and evidence</h2>
-        <table class="tbl" id="g-edges"><thead><tr><th>From → To</th><th>Kind</th><th>Evidence</th></tr></thead><tbody></tbody></table>
-        <h3 class="mt">Suppressed by manual correction</h3>
-        <table class="tbl" id="g-suppressed"><thead><tr><th>From → To</th><th>Was</th><th></th></tr></thead><tbody></tbody></table>
-      </div>
-      <div class="card">
-        <h2>Manual corrections</h2>
-        <form id="g-form" class="form">
-          <label>Action
-            <select name="action">
-              <option value="add_edge">Add dependency edge</option>
-              <option value="remove_edge">Suppress discovered edge</option>
-              <option value="note">Annotate service</option>
-            </select></label>
-          <label class="edge-only">From <select name="from"></select></label>
-          <label class="edge-only">To <select name="to"></select></label>
-          <label class="note-only" hidden>Service <select name="node"></select></label>
-          <label>Note <input name="note" maxlength="200" placeholder="why this correction"></label>
-          <button type="submit">Apply correction</button>
-        </form>
-        <h3 class="mt">Active corrections</h3>
-        <table class="tbl" id="g-overrides"><thead><tr><th>Correction</th><th>Note</th><th></th></tr></thead><tbody></tbody></table>
-      </div>
-    </div>
-  </section>
-
-  <!-- ======================================================== LAB -->
-  <section id="tab-lab" class="tab">
-    <div class="grid cols-2">
-      <div class="card">
-        <h2>Configure experiment</h2>
-        <form id="exp-form" class="form">
-          <label>Name <input name="name" value="db hang" maxlength="80"></label>
-          <label>Hypothesis <textarea name="hypothesis" rows="2" maxlength="400">If the database hangs, the Paperless API fails fast enough for the safety controller to abort, and it recovers within 30s once the database is back.</textarea></label>
-          <div class="row">
-            <label>Failure type <select name="fault_type"></select></label>
-            <label>Target <select name="target"></select></label>
-          </div>
-          <div class="row">
-            <label>Duration (s) <input name="duration_s" type="number" value="30"></label>
-            <label class="lat-only" hidden>Latency (ms) <input name="latency_ms" type="number" value="300"></label>
-            <label>Recovery timeout (s) <input name="recovery_timeout_s" type="number" value="90"></label>
-          </div>
-          <fieldset>
-            <legend>Automatic abort thresholds (rolling window, fault phase)</legend>
-            <div class="row">
-              <label>Max error rate (%) <input name="max_error_rate" type="number" value="50" min="1" max="100"></label>
-              <label>Max p95 latency (ms) <input name="max_p95_latency_ms" type="number" value="4000"></label>
-              <label>Window (s) <input name="window_s" type="number" value="10"></label>
-              <label>Min samples <input name="min_samples" type="number" value="3"></label>
-            </div>
-          </fieldset>
-          <p class="muted small" id="limits-desc"></p>
-          <div class="row">
-            <button type="button" id="btn-preflight">Run preflight checks</button>
-            <button type="submit" id="btn-start" class="primary">Start experiment</button>
-          </div>
-        </form>
-        <div id="exp-errors" class="banner warning" hidden></div>
-        <h3 class="mt">Preflight</h3>
-        <ul class="checks" id="preflight"><li class="muted">Not run yet.</li></ul>
-      </div>
-      <div class="card">
-        <div class="row between"><h2>Live experiment</h2><span id="live-id" class="muted small"></span></div>
-        <ol class="pipeline" id="pipeline"></ol>
-        <div class="grid cols-3 tight" id="live-stats"></div>
-        <div id="live-countdown" class="muted small"></div>
-        <div id="live-breach" class="banner critical" hidden></div>
-        <div id="live-chart" class="chart small-chart"></div>
-        <h3>Event log</h3>
-        <table class="tbl" id="live-events"><thead><tr><th>Time</th><th>Event</th><th>Message</th></tr></thead><tbody></tbody></table>
-      </div>
-    </div>
-  </section>
-
-  <!-- ======================================================== OBSERVABILITY -->
-  <section id="tab-obs" class="tab">
-    <div class="card">
-      <div class="row between">
-        <h2>Run <select id="obs-run"></select></h2>
-        <div class="row"><a id="obs-report" target="_blank" class="small">plain-text report ↗</a></div>
+    <details class="card">
+      <summary>Run history and details</summary>
+      <div class="row between mt">
+        <label class="small">Run <select id="obs-run"></select></label>
+        <span class="small"><a id="obs-report" target="_blank">text report ↗</a> · <a id="obs-export" target="_blank">evidence JSON ↗</a></span>
       </div>
       <div id="obs-empty" class="empty" hidden>No runs recorded yet.</div>
-      <div class="grid cols-4" id="obs-cards"></div>
-    </div>
-    <div class="card">
-      <h2>Request latency by probe <span class="muted small">failed probes marked ✕; fault window shaded</span></h2>
-      <div class="legend small" id="obs-legend"></div>
       <div id="obs-latency" class="chart"></div>
-    </div>
-    <div class="grid cols-2">
-      <div class="card">
-        <h2>Error rate (critical probes, 5s buckets)</h2>
-        <div id="obs-errors" class="chart small-chart"></div>
-      </div>
-      <div class="card">
-        <h2>Service health over time</h2>
-        <div id="obs-health"></div>
-      </div>
-    </div>
-    <div class="card">
-      <h2>Before / during / after</h2>
-      <div class="tblwrap"><table class="tbl" id="obs-phases"><thead><tr><th>Phase</th><th>Probe</th><th>n</th><th>Errors</th><th>Error rate</th><th>p50</th><th>p95</th></tr></thead><tbody></tbody></table></div>
-      <ul id="obs-impact" class="obs"></ul>
-    </div>
-    <div class="card">
-      <div class="row between">
-        <h2>AI analysis <span class="muted small" id="obs-an-src"></span></h2>
-        <button id="obs-analyze">Analyse this run</button>
-      </div>
-      <div id="obs-analysis"><div class="muted">Select an experiment run.</div></div>
-    </div>
-    <div class="grid cols-2">
-      <div class="card">
-        <h2>Fault removal &amp; recovery</h2>
-        <div id="obs-recovery"></div>
-        <h3 class="mt">Failed application checks</h3>
-        <div class="tblwrap scroll"><table class="tbl" id="obs-failed"><thead><tr><th>Time</th><th>Phase</th><th>Probe</th><th>Latency</th><th>Detail</th></tr></thead><tbody></tbody></table></div>
-      </div>
-      <div class="card">
-        <h2>Relevant container logs</h2>
-        <div id="obs-logs"></div>
-        <h3 class="mt">Run events</h3>
-        <div class="tblwrap scroll"><table class="tbl" id="obs-events"><thead><tr><th>Time</th><th>Event</th><th>Message</th></tr></thead><tbody></tbody></table></div>
-      </div>
-    </div>
-  </section>
-  <!-- ======================================================== AI PLANNER -->
-  <section id="tab-plan" class="tab">
-    <div class="card">
-      <div class="row between">
-        <h2>Chaos Planner (Agent 1) <span class="muted small" id="pl-src"></span></h2>
-        <div class="row">
-          <span id="pl-ai" class="pill">AI: …</span>
-          <button id="pl-generate" class="primary">Generate ranked plan</button>
+      <div class="grid cols-2">
+        <div>
+          <h3>Before / during / after</h3>
+          <div class="tblwrap scroll"><table class="tbl" id="obs-phases"><thead><tr><th>Phase</th><th>Probe</th><th>n</th><th>Error rate</th><th>p50</th><th>p95</th></tr></thead><tbody></tbody></table></div>
+        </div>
+        <div>
+          <h3>Rollback and recovery</h3>
+          <div id="obs-recovery"></div>
+          <h3 class="mt">Container logs</h3>
+          <div id="obs-logs"></div>
         </div>
       </div>
-      <p class="muted small">The planner reads the discovered dependency map, the experiment catalogue and earlier results, and proposes
-        ranked experiments. It cannot run anything: every recommendation is re-validated by the safety controller, and nothing
-        starts until you approve it below.</p>
-      <div id="pl-empty" class="empty" hidden>No plan yet. Generate one.</div>
-      <div class="tblwrap"><table class="tbl" id="pl-recs"><thead><tr><th></th><th>#</th><th>Experiment</th><th>Hypothesis and reason for this rank</th><th>Expected effects</th><th>Status</th></tr></thead><tbody></tbody></table></div>
-      <div id="pl-rejected" class="banner warning" hidden></div>
-      <div class="row mt">
-        <button id="pl-run" class="primary">Approve &amp; run selected in sequence</button>
-        <span class="muted small">Runs one at a time; each run passes preflight first. The sequence stops if a run is rejected,
-          unrecovered or blocked, or when the kill switch is used.</span>
-      </div>
-    </div>
-    <div class="card">
-      <h2>Sequence execution <span class="muted small" id="pl-exec-state"></span></h2>
-      <table class="tbl" id="pl-steps"><thead><tr><th>#</th><th>Experiment</th><th>Run</th><th>State</th><th>Result</th><th>Notes</th></tr></thead><tbody></tbody></table>
-    </div>
+    </details>
+
+    <details class="card">
+      <summary>Manual experiment and baseline</summary>
+      <form id="exp-form" class="form mt">
+        <div class="row">
+          <label>Name <input name="name" value="manual experiment" maxlength="80"></label>
+          <label>Failure type <select name="fault_type"></select></label>
+          <label>Target <select name="target"></select></label>
+          <label>Duration (s) <input name="duration_s" type="number" value="20"></label>
+          <label class="lat-only" hidden>Latency (ms) <input name="latency_ms" type="number" value="300"></label>
+        </div>
+        <label>Hypothesis <input name="hypothesis" maxlength="400" value=""></label>
+        <div class="row">
+          <label>Abort at error rate (%) <input name="max_error_rate" type="number" value="80" min="1" max="100"></label>
+          <label>Abort at p95 (ms) <input name="max_p95_latency_ms" type="number" value="6000"></label>
+          <label>Window (s) <input name="window_s" type="number" value="10"></label>
+          <label>Min samples <input name="min_samples" type="number" value="3"></label>
+          <label>Recovery timeout (s) <input name="recovery_timeout_s" type="number" value="90"></label>
+        </div>
+        <p class="muted small" id="limits-desc"></p>
+        <div class="row" style="align-items:center">
+          <button type="button" id="btn-preflight">Run preflight checks</button>
+          <button type="submit" id="btn-start" class="primary">Start experiment</button>
+          <span class="small muted">or</span>
+          <label class="small inline">baseline only <input id="base-dur" type="number" min="10" max="300" value="30" class="w60">s</label>
+          <button type="button" id="run-baseline">Run baseline</button>
+        </div>
+      </form>
+      <div id="exp-errors" class="banner warning" hidden></div>
+      <ul class="checks" id="preflight"></ul>
+    </details>
   </section>
 
   <!-- ======================================================== FINDINGS -->
   <section id="tab-findings" class="tab">
-    <div class="card">
-      <div class="row between">
-        <h2>Resilience score <span class="muted small">computed from measurements, never by the AI</span></h2>
-        <div class="row">
-          <button id="fd-analyze-all">Analyse unanalysed runs</button>
-          <a href="/api/report" target="_blank" class="small">final findings report ↗</a>
+    <div class="grid fd-top">
+      <div class="card" id="fd-score"></div>
+      <div class="card">
+        <div class="row between">
+          <h2>Weaknesses found, worst first</h2>
+          <span class="row" style="align-items:center">
+            <button id="fd-analyze-all">Analyse new runs</button>
+            <a href="/api/report" target="_blank" class="small">full report ↗</a>
+          </span>
         </div>
+        <table class="tbl roomy" id="fd-summary"><thead><tr><th>#</th><th>Failure tested</th><th>Severity</th><th>Impact</th><th>Recovery</th></tr></thead><tbody></tbody></table>
+        <p class="muted small" id="fd-note"></p>
       </div>
-      <div class="grid cols-4" id="fd-cards"></div>
-      <p class="muted small" id="fd-note"></p>
-      <table class="tbl" id="fd-scenarios"><thead><tr><th>Scenario</th><th>Run used</th><th>Run status</th><th>Resilience</th><th>Severity</th></tr></thead><tbody></tbody></table>
     </div>
-    <div class="card">
-      <h2>Ranked findings <span class="muted small">worst first · measured facts vs AI hypotheses are labelled</span></h2>
-      <div id="fd-empty" class="empty" hidden>No analysed experiment yet. Run an experiment, then analyse it.</div>
-      <div id="fd-list"></div>
-    </div>
-    <div class="card">
-      <h2>Scoring methodology</h2>
+    <div id="fd-notice" class="note" hidden></div>
+    <div id="fd-empty" class="empty" hidden>No analysed experiment yet. Run the plan on the Experiments tab.</div>
+    <div id="fd-list"></div>
+    <details class="card" id="fd-other-wrap" hidden><summary>Earlier and inconclusive runs</summary><div id="fd-other"></div></details>
+    <details class="card">
+      <summary>How the scores are computed</summary>
       <pre class="logs" id="fd-method"></pre>
-    </div>
+    </details>
   </section>
 </main>
 <div id="tip" class="tip" hidden></div>
