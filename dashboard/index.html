@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paperless Chaos Lab</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <strong>Paperless Chaos Lab</strong>
+    <span class="muted">Day 1 · sandbox <code>paperless-chaos</code></span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="graph">Dependency Map</button>
+    <button data-tab="lab">Experiment Lab</button>
+    <button data-tab="obs">Observability</button>
+  </nav>
+  <div class="topstate">
+    <span id="conn" class="pill">connecting…</span>
+    <span id="top-exp" class="pill">idle</span>
+    <button id="kill" class="kill" title="Abort any running experiment and remove every fault now">■ KILL SWITCH</button>
+  </div>
+</header>
+<div id="blocked-banner" class="banner critical" hidden>
+  <span>⛔ <strong>Experiments blocked:</strong> <span id="blocked-reason"></span></span>
+  <button id="unblock">Verify environment &amp; unblock</button>
+</div>
+<div id="toast" class="toast" hidden></div>
+
+<main>
+  <!-- ======================================================== OVERVIEW -->
+  <section id="tab-overview" class="tab active">
+    <div class="grid cols-4">
+      <div class="card stat" id="ov-app"><h3>Application</h3><div class="big">–</div><div class="sub"></div></div>
+      <div class="card stat" id="ov-deps"><h3>Dependencies</h3><div class="big">–</div><div class="sub"></div></div>
+      <div class="card stat" id="ov-exp"><h3>Current experiment</h3><div class="big">–</div><div class="sub"></div></div>
+      <div class="card stat" id="ov-safety"><h3>Safety controller</h3><div class="big">–</div><div class="sub"></div></div>
+    </div>
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Services <span class="muted small" id="ov-svc-ts"></span></h2>
+        <table class="tbl" id="ov-services"><thead><tr><th>Service</th><th>State</th><th>Health</th><th>Container</th></tr></thead><tbody></tbody></table>
+        <h2 class="mt">Live application probes</h2>
+        <table class="tbl" id="ov-probes"><thead><tr><th>Probe</th><th>Result</th><th>Latency</th><th>Detail</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <div class="row between">
+          <h2>Baseline <span class="muted small" id="ov-base-ts"></span></h2>
+          <div class="row">
+            <label class="small">duration <input id="base-dur" type="number" min="10" max="300" value="30" class="w60">s</label>
+            <button id="run-baseline">Run baseline workload</button>
+          </div>
+        </div>
+        <p class="muted small">Workload <span id="wl-desc"></span></p>
+        <table class="tbl" id="ov-baseline"><thead><tr><th>Probe</th><th>n</th><th>Error rate</th><th>p50</th><th>p95</th></tr></thead><tbody></tbody></table>
+        <div id="ov-base-empty" class="empty" hidden>No completed baseline yet. Run one before experimenting.</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Monitor: last 15 minutes <span class="muted small">(always-on probes, every 5s)</span></h2>
+      <div id="ov-monitor-chart" class="chart"></div>
+    </div>
+    <div class="card">
+      <h2>Safety events</h2>
+      <table class="tbl" id="ov-events"><thead><tr><th>Time</th><th>Event</th><th>Run</th><th>Message</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- ======================================================== GRAPH -->
+  <section id="tab-graph" class="tab">
+    <div class="card">
+      <div class="row between">
+        <h2>Dependency map <span class="muted small" id="g-src"></span></h2>
+        <button id="g-refresh">Re-discover</button>
+      </div>
+      <div class="legend small" id="g-legend"></div>
+      <div id="g-svg" class="graph"></div>
+      <div id="g-error" class="banner warning" hidden></div>
+    </div>
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Edges and evidence</h2>
+        <table class="tbl" id="g-edges"><thead><tr><th>From → To</th><th>Kind</th><th>Evidence</th></tr></thead><tbody></tbody></table>
+        <h3 class="mt">Suppressed by manual correction</h3>
+        <table class="tbl" id="g-suppressed"><thead><tr><th>From → To</th><th>Was</th><th></th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <h2>Manual corrections</h2>
+        <form id="g-form" class="form">
+          <label>Action
+            <select name="action">
+              <option value="add_edge">Add dependency edge</option>
+              <option value="remove_edge">Suppress discovered edge</option>
+              <option value="note">Annotate service</option>
+            </select></label>
+          <label class="edge-only">From <select name="from"></select></label>
+          <label class="edge-only">To <select name="to"></select></label>
+          <label class="note-only" hidden>Service <select name="node"></select></label>
+          <label>Note <input name="note" maxlength="200" placeholder="why this correction"></label>
+          <button type="submit">Apply correction</button>
+        </form>
+        <h3 class="mt">Active corrections</h3>
+        <table class="tbl" id="g-overrides"><thead><tr><th>Correction</th><th>Note</th><th></th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================== LAB -->
+  <section id="tab-lab" class="tab">
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Configure experiment</h2>
+        <form id="exp-form" class="form">
+          <label>Name <input name="name" value="db hang" maxlength="80"></label>
+          <label>Hypothesis <textarea name="hypothesis" rows="2" maxlength="400">If the database hangs, the Paperless API fails fast enough for the safety controller to abort, and it recovers within 30s once the database is back.</textarea></label>
+          <div class="row">
+            <label>Failure type <select name="fault_type"></select></label>
+            <label>Target <select name="target"></select></label>
+          </div>
+          <div class="row">
+            <label>Duration (s) <input name="duration_s" type="number" value="30"></label>
+            <label class="lat-only" hidden>Latency (ms) <input name="latency_ms" type="number" value="300"></label>
+            <label>Recovery timeout (s) <input name="recovery_timeout_s" type="number" value="90"></label>
+          </div>
+          <fieldset>
+            <legend>Automatic abort thresholds (rolling window, fault phase)</legend>
+            <div class="row">
+              <label>Max error rate (%) <input name="max_error_rate" type="number" value="50" min="1" max="100"></label>
+              <label>Max p95 latency (ms) <input name="max_p95_latency_ms" type="number" value="4000"></label>
+              <label>Window (s) <input name="window_s" type="number" value="10"></label>
+              <label>Min samples <input name="min_samples" type="number" value="3"></label>
+            </div>
+          </fieldset>
+          <p class="muted small" id="limits-desc"></p>
+          <div class="row">
+            <button type="button" id="btn-preflight">Run preflight checks</button>
+            <button type="submit" id="btn-start" class="primary">Start experiment</button>
+          </div>
+        </form>
+        <div id="exp-errors" class="banner warning" hidden></div>
+        <h3 class="mt">Preflight</h3>
+        <ul class="checks" id="preflight"><li class="muted">Not run yet.</li></ul>
+      </div>
+      <div class="card">
+        <div class="row between"><h2>Live experiment</h2><span id="live-id" class="muted small"></span></div>
+        <ol class="pipeline" id="pipeline"></ol>
+        <div class="grid cols-3 tight" id="live-stats"></div>
+        <div id="live-countdown" class="muted small"></div>
+        <div id="live-breach" class="banner critical" hidden></div>
+        <div id="live-chart" class="chart small-chart"></div>
+        <h3>Event log</h3>
+        <table class="tbl" id="live-events"><thead><tr><th>Time</th><th>Event</th><th>Message</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================== OBSERVABILITY -->
+  <section id="tab-obs" class="tab">
+    <div class="card">
+      <div class="row between">
+        <h2>Run <select id="obs-run"></select></h2>
+        <div class="row"><a id="obs-report" target="_blank" class="small">plain-text report ↗</a></div>
+      </div>
+      <div id="obs-empty" class="empty" hidden>No runs recorded yet.</div>
+      <div class="grid cols-4" id="obs-cards"></div>
+    </div>
+    <div class="card">
+      <h2>Request latency by probe <span class="muted small">failed probes marked ✕; fault window shaded</span></h2>
+      <div class="legend small" id="obs-legend"></div>
+      <div id="obs-latency" class="chart"></div>
+    </div>
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Error rate (critical probes, 5s buckets)</h2>
+        <div id="obs-errors" class="chart small-chart"></div>
+      </div>
+      <div class="card">
+        <h2>Service health over time</h2>
+        <div id="obs-health"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Before / during / after</h2>
+      <div class="tblwrap"><table class="tbl" id="obs-phases"><thead><tr><th>Phase</th><th>Probe</th><th>n</th><th>Errors</th><th>Error rate</th><th>p50</th><th>p95</th></tr></thead><tbody></tbody></table></div>
+      <ul id="obs-impact" class="obs"></ul>
+    </div>
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Fault removal &amp; recovery</h2>
+        <div id="obs-recovery"></div>
+        <h3 class="mt">Failed application checks</h3>
+        <div class="tblwrap scroll"><table class="tbl" id="obs-failed"><thead><tr><th>Time</th><th>Phase</th><th>Probe</th><th>Latency</th><th>Detail</th></tr></thead><tbody></tbody></table></div>
+      </div>
+      <div class="card">
+        <h2>Relevant container logs</h2>
+        <div id="obs-logs"></div>
+        <h3 class="mt">Run events</h3>
+        <div class="tblwrap scroll"><table class="tbl" id="obs-events"><thead><tr><th>Time</th><th>Event</th><th>Message</th></tr></thead><tbody></tbody></table></div>
+      </div>
+    </div>
+  </section>
+</main>
+<div id="tip" class="tip" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

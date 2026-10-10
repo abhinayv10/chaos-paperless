@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+sandbox/.env
+sandbox/consume/*
+sandbox/export/*
+!sandbox/consume/.gitkeep
+!sandbox/export/.gitkeep
