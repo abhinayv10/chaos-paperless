@@ -8,6 +8,7 @@ project *and* carries the chaos.sandbox=true label.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -95,10 +96,17 @@ class Docker:
 
     # -- low level ---------------------------------------------------------------
     def _run(self, args: list[str], timeout: float = 30, check: bool = True) -> subprocess.CompletedProcess:
+        # docker shells out to helpers (docker-credential-desktop, compose
+        # plugins) that live next to the binary; make sure they resolve even
+        # when Docker's bin dir is not on this process' PATH.
+        env = dict(os.environ)
+        bindir = os.path.dirname(self.binary)
+        if bindir:
+            env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
         try:
             cp = subprocess.run(
                 [self.binary, *args], capture_output=True, text=True, timeout=timeout,
-                encoding="utf-8", errors="replace",
+                encoding="utf-8", errors="replace", env=env,
             )
         except FileNotFoundError as e:
             raise DockerError(f"docker CLI not found ({self.binary})") from e
