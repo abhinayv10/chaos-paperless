@@ -75,6 +75,8 @@ function showTab(name) {
   $$(".tab").forEach((t) => t.classList.toggle("active", t.id === "tab-" + name));
   if (name === "graph") loadGraph();
   if (name === "obs") loadRuns(true);
+  if (name === "plan") loadPlan();
+  if (name === "findings") loadFindings();
 }
 
 // ---------------------------------------------------------------- kill switch + unblock
@@ -496,6 +498,7 @@ async function loadRun(id) {
   const logs = o.logs || {};
   $("#obs-logs").innerHTML = Object.keys(logs).length ? Object.entries(logs).map(([svc, l]) => `<h3>${esc(svc)} <span class="muted small">${l.relevant.length} relevant of ${l.total} lines since fault start</span></h3><pre class="logs">${esc((l.relevant.length ? l.relevant : l.tail).join("\n")) || "(no log lines)"}</pre>`).join("") : `<div class="muted">${r.kind === "experiment" ? (TERMINAL.includes(r.state) ? "No logs captured (no fault was injected)." : "Logs are captured when the run finishes.") : "Baseline runs do not capture logs."}</div>`;
   rows($("#obs-events tbody"), (r.events || []).map((e) => `<tr><td>${fmtTime(e.ts)}</td><td>${badge(e.kind, e.level === "error" ? "st-critical" : e.level === "warning" ? "st-warning" : "st-good")}</td><td class="small">${esc(e.message)}</td></tr>`), 3, "no events");
+  loadAnalysis(r);
 }
 function renderHealth(el, health, r) {
   if (!health.length) { el.innerHTML = `<div class="empty">No health samples.</div>`; return; }
@@ -521,4 +524,118 @@ async function refreshAll() {
   setInterval(() => { if (currentTab === "overview") loadMonitorChart(); }, 10000);
   setInterval(() => { if (currentTab === "graph") loadGraph(); }, 5000);
   setInterval(() => { if (currentTab === "obs") loadRuns(false); }, 6000);
+  setInterval(() => { if (currentTab === "plan") loadPlan(); if (currentTab === "findings") loadFindings(); }, 4000);
 })();
+
+// ================================================================ Day 2: AI planner, analyst, findings
+const fmtScore = (v) => (v == null ? "n/a" : Math.round(v) + "/100");
+const sevBadge = (s) => `<b class="sev-${esc(s.category)}">${fmtScore(s.score)} ${esc(s.category)}</b>`;
+const srcTag = (src) => (src.mode === "llm" ? `<span class="tag ai">AI · ${esc(src.provider)}:${esc(src.model)}</span>` : `<span class="tag">rules${src.error ? " · LLM failed" : ""}</span>`);
+let planData = null, planChecked = null;
+
+async function loadPlan() {
+  let d;
+  try { d = await api("/api/plan"); } catch (e) { $("#pl-src").textContent = "unavailable: " + e.message; return; }
+  api("/api/ai/status").then((a) => { $("#pl-ai").textContent = a.provider ? `AI: ${a.provider}:${a.model}` : "AI: none (deterministic rules)"; }).catch(() => {});
+  planData = d.plan;
+  const p = d.plan;
+  $("#pl-empty").hidden = !!p; $("#pl-recs").hidden = !p;
+  $("#pl-run").disabled = !p || d.sequence_running;
+  if (!p) { rows($("#pl-steps tbody"), [], 6, "no sequence has run"); return; }
+  if (!planChecked || planChecked.id !== p.id) planChecked = { id: p.id, ranks: new Set(p.recommendations.filter((r) => r.status === "planned").map((r) => r.rank)) };
+  $("#pl-src").innerHTML = `${esc(p.id)} · ${fmtTime(p.created)} · ` + (p.source.mode === "llm" ? `AI ${esc(p.source.provider)}:${esc(p.source.model)}` : `deterministic rules${p.source.error ? " (LLM failed: " + esc(p.source.error) + ")" : ""}`) + ` · based on ${p.context.previous_experiments} earlier experiments`;
+  rows($("#pl-recs tbody"), p.recommendations.map((r) => `<tr>
+    <td><input type="checkbox" data-rank="${r.rank}" ${planChecked.ranks.has(r.rank) ? "checked" : ""}></td>
+    <td class="num"><b>${r.rank}</b></td>
+    <td><b>${esc(r.name)}</b><div class="small">${esc(r.fault_type)}${r.latency_ms ? " " + r.latency_ms + "ms" : ""} on <b>${esc(r.target)}</b> · ${r.duration_s}s<br>abort at ${fmtPct(r.abort_max_error_rate)} errors / ${fmtMs(r.abort_max_p95_latency_ms)} p95</div></td>
+    <td class="small"><b>Hypothesis:</b> ${esc(r.hypothesis)}<br><b>Why:</b> ${esc(r.rationale)}${r.risks.length ? "<br><b>Risks:</b> " + esc(r.risks.join("; ")) : ""}</td>
+    <td class="small">${esc(r.expected_effects.join("; "))}<div class="muted">deps: ${esc(r.dependencies.join(", "))}</div></td>
+    <td>${badge(r.status, r.status === "executed" ? "st-good" : r.status === "rejected" ? "st-critical" : r.status === "running" ? "st-serious" : "st-unknown")}${r.run_id ? `<div class="small"><code>${esc(r.run_id)}</code></div>` : ""}</td></tr>`), 6, "plan has no valid recommendations");
+  const rej = p.rejected || [];
+  $("#pl-rejected").hidden = !rej.length;
+  $("#pl-rejected").innerHTML = rej.map((r) => `<div>Rejected by validation: <b>${esc(r.name)}</b>: ${esc(r.errors.join("; "))}</div>`).join("");
+  const ex = p.execution;
+  $("#pl-exec-state").textContent = ex ? `${ex.status}${ex.stop_reason ? " · " + ex.stop_reason : ""}` : "not started";
+  rows($("#pl-steps tbody"), (ex ? ex.steps : []).map((s) => `<tr><td class="num">${s.rank}</td><td>${esc(s.name)}</td><td class="small"><code>${esc(s.run_id || "–")}</code></td><td>${s.state ? badge(s.state) : badge("running", "st-serious")}</td><td class="small">${esc(s.result || "")}</td><td class="small">${esc([...(s.errors || []), s.analysis_error ? "analysis: " + s.analysis_error : ""].filter(Boolean).join("; "))}</td></tr>`), 6, "no sequence has run for this plan");
+}
+document.addEventListener("change", (e) => {
+  const c = e.target.closest("#pl-recs input[data-rank]"); if (!c || !planChecked) return;
+  c.checked ? planChecked.ranks.add(+c.dataset.rank) : planChecked.ranks.delete(+c.dataset.rank);
+});
+$("#pl-generate").addEventListener("click", async () => {
+  const b = $("#pl-generate"); b.disabled = true; b.textContent = "Planning…";
+  try { const p = await api("/api/plan", { method: "POST" }); planChecked = null; toast(`Plan ${p.id}: ${p.recommendations.length} recommendations (${p.source.mode})`); }
+  catch (e) { toast("Planning failed: " + e.message); }
+  finally { b.disabled = false; b.textContent = "Generate ranked plan"; loadPlan(); }
+});
+$("#pl-run").addEventListener("click", async () => {
+  if (!planData || !planChecked) return;
+  const ranks = [...planChecked.ranks].sort((a, b) => a - b);
+  if (!ranks.length) { toast("Select at least one recommendation."); return; }
+  try { await api(`/api/plan/${encodeURIComponent(planData.id)}/run`, { method: "POST", body: { ranks } }); toast("Sequence started: ranks " + ranks.join(", ")); }
+  catch (e) { toast("Sequence rejected: " + e.message, 9000); }
+  loadPlan(); pollLive();
+});
+
+function findingHtml(f, compact) {
+  const d = f.diagnosis, det = f.deterministic, facts = Object.fromEntries(det.facts.map((x) => [x.id, x.text]));
+  const tag = f.source.mode === "llm" ? `<span class="tag ai">AI hypothesis</span>` : `<span class="tag">rule-based hypothesis</span>`;
+  const ev = (ids, sign) => ids.map((i) => `<li class="fact">${sign} <b>${esc(i)}</b> ${esc(facts[i] || "?")}</li>`).join("");
+  return `<div class="finding">
+    <h3>${sevBadge(f.severity)} · ${esc(det.fault_type)}${det.latency_ms ? " " + det.latency_ms + "ms" : ""} on ${esc(det.target)} <span class="muted small"><code>${esc(f.run_id)}</code> · run ${esc(f.status)}</span></h3>
+    <div class="small"><span class="tag">measured</span> Impact <b>${esc(det.impact.toUpperCase())}</b>: ${esc(det.impact_reason)}. Failed: ${esc(det.failed.join(", ") || "none")} · degraded: ${esc(det.degraded.join(", ") || "none")} · functional: ${esc(det.functional.join(", ") || "none")}.
+      Resilience ${fmtScore(f.resilience.score)} · recovery ${det.recovery_verified ? "verified" + (det.recovery_time_s != null ? " in " + det.recovery_time_s.toFixed(1) + "s" : "") : "<b class='sev-critical'>NOT verified</b>"}.</div>
+    <p>${srcTag(f.source)} ${esc(d.summary)} ${d.inconclusive ? "<b>Inconclusive.</b>" : ""}</p>
+    ${d.root_causes.map((rc) => `<div>${tag} <b>${rc.rank}.</b> ${esc(rc.hypothesis)} <span class="muted small">(${esc(rc.component)}, ${esc(rc.confidence)} confidence)</span><ul>${ev(rc.supporting_evidence, "supports")}${ev(rc.contradicting_evidence, "contradicts")}</ul></div>`).join("")}
+    ${d.weakness ? `<div><b>Likely weakness:</b> ${esc(d.weakness)}</div>` : ""}
+    <div><b>Recommended fix</b> <span class="tag">${esc(d.recommendation.category)}</span> ${esc(d.recommendation.action)} <span class="muted small">${esc(d.recommendation.rationale)}</span></div>
+    <ul>${d.verification.steps.map((s) => `<li class="small">verify: ${esc(s)}</li>`).join("")}${d.verification.success_criteria.map((s) => `<li class="small">success when: ${esc(s)}</li>`).join("")}</ul>
+    ${f.retest ? `<div class="small">Compared with previous run <code>${esc(f.retest.previous_run)}</code>: severity ${f.retest.severity_delta ?? "n/a"}, resilience ${f.retest.resilience_delta ?? "n/a"}, impact ${esc(f.retest.impact_before)} → ${esc(f.retest.impact_after)}.</div>` : ""}
+    ${compact ? "" : `<details class="small"><summary>All measured facts (${det.facts.length}) and limitations</summary><ul>${det.facts.map((x) => `<li class="fact"><b>${esc(x.id)}</b> ${esc(x.text)}</li>`).join("")}</ul><ul>${[...det.limitations, ...d.limitations].map((x) => `<li class="muted">${esc(x)}</li>`).join("")}</ul></details>`}
+    <div class="small muted">confidence: ${esc(d.confidence)} · <a href="/api/runs/${encodeURIComponent(f.run_id)}/export" target="_blank">evidence JSON ↗</a></div>
+  </div>`;
+}
+async function loadAnalysis(r) {
+  const box = $("#obs-analysis"), btn = $("#obs-analyze");
+  btn.hidden = r.kind !== "experiment" || !TERMINAL.includes(r.state) || r.state === "rejected";
+  btn.dataset.run = r.id; $("#obs-an-src").textContent = "";
+  if (r.kind !== "experiment") { box.innerHTML = `<div class="muted">Baseline runs are not analysed.</div>`; return; }
+  try {
+    const f = await api(`/api/runs/${encodeURIComponent(r.id)}/analysis`);
+    if (btn.dataset.run !== r.id) return;
+    btn.textContent = "Re-analyse"; box.innerHTML = findingHtml(f, false);
+  } catch (e) {
+    btn.textContent = "Analyse this run";
+    box.innerHTML = `<div class="muted">${e.status === 404 ? "Not analysed yet." : "Analysis unavailable: " + esc(e.message)}</div>`;
+  }
+}
+$("#obs-analyze").addEventListener("click", async (ev) => {
+  const b = ev.target, id = b.dataset.run; b.disabled = true; b.textContent = "Analysing…";
+  try { await api(`/api/runs/${encodeURIComponent(id)}/analyze`, { method: "POST" }); } catch (e) { toast("Analysis failed: " + e.message); }
+  b.disabled = false; if (selectedRun === id) loadRun(id);
+});
+async function loadFindings() {
+  let d;
+  try { d = await api("/api/findings"); } catch (e) { $("#fd-note").textContent = "Findings unavailable: " + e.message; return; }
+  const sig = JSON.stringify(d);
+  if (sig === loadFindings.last) return;  // unchanged: keep open details as they are
+  loadFindings.last = sig;
+  const o = d.overall, pct = (v) => (v == null ? "n/a" : Math.round(v * 100) + "%");
+  $("#fd-cards").innerHTML = [
+    ["Overall resilience", fmtScore(o.score), o.capped_unrecovered ? "CAPPED: an experiment left recovery unverified" : `mean of ${o.scenarios_scored} scored scenario(s)`],
+    ["Coverage", `${o.scenarios_scored} / ${o.scenarios_total} scenarios`, `${o.experiments_analysed} experiments analysed: ` + Object.entries(o.counts).map(([k, v]) => `${v} ${k}`).join(", ")],
+    ["Availability under fault", pct(o.components.availability), `weight ${pct(o.weights.availability)}`],
+    ["Performance · Recovery", `${pct(o.components.performance)} · ${pct(o.components.recovery)}`, `weights ${pct(o.weights.performance)} · ${pct(o.weights.recovery)}`],
+  ].map(([k, v, s]) => `<div class="mini"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div><div class="small muted">${esc(s)}</div></div>`).join("");
+  $("#fd-note").textContent = o.note + (o.untested_scenarios.length ? " Not yet tested: " + o.untested_scenarios.map((s) => s.join(" on ")).join(", ") + "." : "");
+  rows($("#fd-scenarios tbody"), o.per_scenario.map((s) => `<tr><td>${esc(s.fault_type)} on <b>${esc(s.target)}</b></td><td class="small"><code>${esc(s.run_id)}</code></td><td>${badge(s.status, s.status === "completed" ? "st-good" : s.status === "unrecovered" ? "st-critical" : "st-warning")}</td><td class="num">${fmtScore(s.resilience)}</td><td>${sevBadge({ score: s.severity, category: s.severity_category })}</td></tr>`), 5, "no scored scenario yet");
+  $("#fd-empty").hidden = d.findings.length > 0;
+  $("#fd-list").innerHTML = d.findings.map((f) => findingHtml(f, false)).join("");
+  $("#fd-method").textContent = d.methodology;
+}
+$("#fd-analyze-all").addEventListener("click", async (ev) => {
+  ev.target.disabled = true;
+  try { const r = await api("/api/analyze-all", { method: "POST" }); toast(`Analysed ${r.analysed.length} run(s)` + (Object.keys(r.errors).length ? `; ${Object.keys(r.errors).length} failed` : "")); }
+  catch (e) { toast("Analysis failed: " + e.message); }
+  ev.target.disabled = false; loadFindings();
+});

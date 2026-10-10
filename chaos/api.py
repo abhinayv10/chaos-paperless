@@ -12,14 +12,18 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from . import config
+from . import catalog as experiment_catalog
+from . import config, llm, pipeline
 from .discovery import discover, load_overrides, save_overrides
 from .docker_ops import Docker
 from .engine import Engine, ExperimentRejected
+from .evidence import build_evidence
 from .models import FAULT_LABELS, ExperimentConfig
 from .monitor import MONITOR_RUN, Monitor
+from .orchestrator import Orchestrator
 from .paperless_client import PaperlessClient
-from .report import format_report
+from .planner import make_plan
+from .report import format_analysis, format_report
 from .storage import Store
 from .workload import INTERVALS, WORKLOAD_VERSION
 
@@ -38,12 +42,36 @@ class BaselineRequest(BaseModel):
     duration_s: int = 30
 
 
+class PlanRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ranks: Optional[list[int]] = Field(None, max_length=20)
+
+
+AUTO = "auto"
+
+
 def create_app(store: Store | None = None, docker: Docker | None = None, engine: Engine | None = None,
-               start_monitor: bool = True) -> FastAPI:
+               start_monitor: bool = True, provider=AUTO, settle_s: float | None = None) -> FastAPI:
     store = store or Store()
     docker = docker or Docker()
     engine = engine or Engine(store, docker, PaperlessClient)
     monitor = Monitor(store, docker, PaperlessClient)
+
+    def get_provider():
+        """The configured LLM provider, or None (-> deterministic rules)."""
+        if provider != AUTO:
+            return provider
+        try:
+            return llm.get_provider()
+        except llm.LLMError as e:
+            store.event("ai_config_error", str(e), level="warning")
+            return None
+
+    def analyze_run(run_id: str) -> dict:
+        return pipeline.analyze_and_export(store, run_id, discover(docker), get_provider())
+
+    orchestrator = Orchestrator(engine, store, after_run=analyze_run,
+                                **({} if settle_s is None else {"settle_s": settle_s}))
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         report = engine.recover_on_startup()
@@ -54,11 +82,13 @@ def create_app(store: Store | None = None, docker: Docker | None = None, engine:
             yield
         finally:
             monitor.stop()
+            orchestrator.stop("controller shutting down")
             if engine.running_here():
                 engine.kill("controller shutting down")
 
-    app = FastAPI(title="Paperless chaos controller", version="day1", lifespan=lifespan)
+    app = FastAPI(title="Paperless chaos controller", version="day2", lifespan=lifespan)
     app.state.engine, app.state.store, app.state.monitor = engine, store, monitor
+    app.state.orchestrator = orchestrator
 
     # ---------------------------------------------------------------- overview
     @app.get("/api/overview")
@@ -181,7 +211,75 @@ def create_app(store: Store | None = None, docker: Docker | None = None, engine:
 
     @app.post("/api/kill")
     def kill():
+        orchestrator.stop("manual kill switch")  # no further planned experiments start
         return engine.kill("manual kill switch (dashboard/API)")
+
+    # ---------------------------------------------------------------- AI planner (agent 1)
+    @app.get("/api/ai/status")
+    def ai_status():
+        return llm.describe(get_provider())
+
+    @app.post("/api/plan")
+    def create_plan():
+        return make_plan(store, discover(docker), get_provider())
+
+    @app.get("/api/plan")
+    def latest_plan():
+        return {"plan": store.latest_plan(), "sequence_running": orchestrator.running(),
+                "capabilities": experiment_catalog.capabilities(),
+                "workflows": experiment_catalog.WORKFLOWS}
+
+    @app.post("/api/plan/{plan_id}/run")
+    def run_plan(plan_id: str, req: PlanRunRequest):
+        try:
+            return {"ok": True} | orchestrator.start(plan_id, req.ranks)
+        except ExperimentRejected as e:
+            return JSONResponse(status_code=e.status, content={"ok": False, "errors": e.errors})
+
+    # ---------------------------------------------------------------- analyst (agent 2) + scores
+    @app.post("/api/runs/{run_id}/analyze")
+    def analyze(run_id: str):
+        try:
+            return analyze_run(run_id)
+        except ValueError as e:
+            raise HTTPException(404, str(e))
+
+    @app.get("/api/runs/{run_id}/analysis")
+    def analysis(run_id: str):
+        a = store.get_analysis(run_id)
+        if not a:
+            raise HTTPException(404, "run has not been analysed")
+        return a
+
+    @app.get("/api/runs/{run_id}/export")
+    def export(run_id: str):
+        ev = build_evidence(store, run_id)
+        if ev is None:
+            raise HTTPException(404, "experiment not found")
+        return {"evidence": ev, "analysis": store.get_analysis(run_id)}
+
+    @app.post("/api/analyze-all")
+    def analyze_all():
+        """Analyse every finished experiment that has no finding yet."""
+        done, errors = [], {}
+        graph, prov = discover(docker), get_provider()
+        for run_id in pipeline.analyzable_runs(store):
+            if store.get_analysis(run_id):
+                continue
+            try:
+                pipeline.analyze_and_export(store, run_id, graph, prov)
+                done.append(run_id)
+            except Exception as e:  # noqa: BLE001
+                errors[run_id] = f"{type(e).__name__}: {e}"
+        return {"analysed": done, "errors": errors}
+
+    @app.get("/api/findings")
+    def findings():
+        return pipeline.findings_summary(store)
+
+    @app.get("/api/report", response_class=PlainTextResponse)
+    def findings_report():
+        return pipeline.full_report(store, docker)
 
     # ---------------------------------------------------------------- runs
     @app.get("/api/runs")
@@ -193,6 +291,7 @@ def create_app(store: Store | None = None, docker: Docker | None = None, engine:
                        | {"config": r.get("config"), "result": o.get("result"),
                           "abort_reason": o.get("abort_reason"),
                           "impact": (o.get("impact") or {}).get("impact_detected"),
+                          "analysed": store.get_analysis(r["id"]) is not None,
                           "recovery_s": (o.get("recovery") or {}).get("recovery_time_s")})
         return out
 
@@ -211,7 +310,8 @@ def create_app(store: Store | None = None, docker: Docker | None = None, engine:
         r = store.get_run(run_id)
         if not r or r["kind"] != "experiment":
             raise HTTPException(404, "experiment not found")
-        return format_report(r)
+        a = store.get_analysis(run_id)
+        return format_report(r) + ("\n" + format_analysis(a) if a else "")
 
     # ---------------------------------------------------------------- safety
     @app.get("/api/safety")

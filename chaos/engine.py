@@ -351,13 +351,18 @@ class Engine:
                     if s["probe"] in ("api_documents", "api_status")]
             streak = 0
             first_ok_ts = None
+            latest: dict[str, bool] = {}
             for s in rows:  # ordered by ts
+                latest[s["probe"]] = bool(s["ok"])
                 if s["ok"]:
                     streak += 1
                     first_ok_ts = first_ok_ts if streak > 1 else s["ts"]
                 else:
                     streak, first_ok_ts = 0, None
-            if target_ok and streak >= need and first_ok_ts is not None:
+            # every recovery probe must have reported, and its newest sample must
+            # be good: a streak made of one probe cannot hide another still failing
+            all_ok = len(latest) == 2 and all(latest.values())
+            if target_ok and all_ok and streak >= need and first_ok_ts is not None:
                 rt = max(0.0, first_ok_ts - fault_end)
                 return True, rt, (f"target healthy and {streak} consecutive successful app probes; "
                                   f"recovered {rt:.1f}s after fault removal")

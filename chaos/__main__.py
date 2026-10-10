@@ -7,13 +7,17 @@ import secrets
 import sys
 import time
 
-from . import config
+from . import config, llm, pipeline
+from .discovery import discover
 from .docker_ops import Docker
 from .engine import Engine, ExperimentRejected
+from .evidence import export_run
 from .faults import emergency_rollback
 from .models import ExperimentConfig, TERMINAL_STATES, Thresholds
+from .orchestrator import Orchestrator
 from .paperless_client import PaperlessClient
-from .report import format_report
+from .planner import make_plan
+from .report import format_analysis, format_report
 from .safety import SafetyState
 from .storage import Store
 
@@ -224,13 +228,201 @@ def cmd_unblock(a) -> int:
     return 0 if ok else 1
 
 
+def _out(text: str, path: str | None = None) -> None:
+    if path:
+        from pathlib import Path
+        Path(path).write_text(text + "\n", encoding="utf-8")
+        print(f"written to {path}")
+    else:
+        print(text)
+
+
 def cmd_report(a) -> int:
     store = Store()
+    if a.run_id == "findings":
+        _out(pipeline.full_report(store, Docker()), a.out)
+        return 0
     run = (store.latest_run("experiment") if a.run_id == "latest" else store.get_run(a.run_id))
     if not run:
         print("no such run")
         return 1
-    print(format_report(run))
+    analysis = store.get_analysis(run["id"])
+    _out(format_report(run) + ("\n" + format_analysis(analysis) if analysis else
+                               "\n\n(not analysed yet: python -m chaos analyze " + run["id"] + ")"), a.out)
+    return 0
+
+
+# ---------------------------------------------------------------- Day 2: AI agents
+def _provider(a):
+    """Resolve the LLM provider; a bad setting is reported and rules are used."""
+    try:
+        prov = llm.get_provider(getattr(a, "provider", None))
+    except llm.LLMError as e:
+        print(f"AI provider error: {e}; using deterministic rules")
+        return None
+    d = llm.describe(prov)
+    print("AI provider:", f"{d['provider']}:{d['model']}" if prov else d["note"])
+    return prov
+
+
+def _print_plan(plan: dict) -> None:
+    src = plan["source"]
+    print(f"{plan['id']}  source: {src['mode']}"
+          + (f" ({src['provider']}:{src['model']})" if src["mode"] == "llm" else "")
+          + (f"  [LLM error: {src['error']}]" if src.get("error") else ""))
+    for r in plan["recommendations"]:
+        lat = f" {r['latency_ms']}ms" if r.get("latency_ms") else ""
+        print(f"  #{r['rank']} {r['fault_type']}{lat} on {r['target']} for {r['duration_s']}s"
+              f"  [{r['status']}{' ' + r['run_id'] if r.get('run_id') else ''}]  {r['name']}")
+        print(f"      hypothesis: {r['hypothesis']}")
+        print(f"      why:        {r['rationale']}")
+        if r["expected_effects"]:
+            print(f"      expect:     {'; '.join(r['expected_effects'])}")
+        if r["risks"]:
+            print(f"      risks:      {'; '.join(r['risks'])}")
+    for r in plan.get("rejected") or []:
+        print(f"  REJECTED by validation: {r['name']}: {'; '.join(r['errors'])}")
+
+
+def cmd_plan(a) -> int:
+    store, docker = Store(), Docker()
+    if a.show:
+        plan = store.latest_plan()
+        if not plan:
+            print("no plan yet: python -m chaos plan")
+            return 1
+    else:
+        plan = make_plan(store, discover(docker), _provider(a))
+    _print_plan(plan)
+    return 0
+
+
+def cmd_plan_run(a) -> int:
+    e = _engine()
+    e.recover_on_startup()
+    store = e.store
+    plan = store.latest_plan() if a.plan_id == "latest" else store.get_plan(a.plan_id)
+    if not plan:
+        print("no such plan: run `python -m chaos plan` first")
+        return 1
+    prov = _provider(a)
+    graph = discover(e.docker)
+    orch = Orchestrator(e, store, after_run=lambda rid: pipeline.analyze_and_export(store, rid, graph, prov))
+    ranks = [int(x) for x in a.ranks.split(",")] if a.ranks else None
+    try:
+        orch.start(plan["id"], ranks)
+    except ExperimentRejected as ex:
+        print("REJECTED:", "; ".join(ex.errors))
+        return 2
+    last = None
+    try:
+        while orch.running():
+            live = e.live()
+            key = (live.get("run_id"), live.get("state"), live.get("message"))
+            if key != last and live.get("run_id"):
+                print(f"{time.strftime('%H:%M:%S')}  {live['run_id']} [{live.get('state')}] {live.get('message')}")
+                last = key
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nCtrl-C: stopping the sequence and triggering the kill switch ...")
+        orch.stop("Ctrl-C in CLI")
+        print(json.dumps(e.kill("Ctrl-C in CLI"), indent=2))
+        orch.wait(180)
+    ex = (store.get_plan(plan["id"]) or {}).get("execution") or {}
+    print(f"\nsequence {ex.get('status')}" + (f": {ex['stop_reason']}" if ex.get("stop_reason") else ""))
+    for st in ex.get("steps", []):
+        f = store.get_analysis(st["run_id"]) if st.get("run_id") else None
+        print(f"  #{st['rank']} {st['name']}: {st.get('run_id') or '-'} {st.get('state')} / {st.get('result')}"
+              + (f" | impact {f['deterministic']['impact']}, severity {f['severity']['category']}" if f else "")
+              + (f" | analysis error: {st['analysis_error']}" if st.get("analysis_error") else "")
+              + (f" | {'; '.join(st['errors'])}" if st.get("errors") else ""))
+    return 0 if ex.get("status") == "completed" else 1
+
+
+def _run_ids(store: Store, which: str) -> list[str]:
+    if which == "all":
+        return pipeline.analyzable_runs(store)
+    if which == "latest":
+        return pipeline.analyzable_runs(store)[-1:]
+    return [which]
+
+
+def cmd_analyze(a) -> int:
+    store = Store()
+    prov, graph = _provider(a), discover(Docker())
+    ids = _run_ids(store, a.run_id)
+    if not ids:
+        print("no finished experiment to analyse")
+        return 1
+    rc = 0
+    for rid in ids:
+        try:
+            f = pipeline.analyze_and_export(store, rid, graph, prov)
+        except ValueError as ex:
+            print(f"{rid}: {ex}")
+            rc = 1
+            continue
+        if len(ids) == 1:
+            print(format_analysis(f))
+        else:
+            print(f"{rid}: impact {f['deterministic']['impact']}, severity {f['severity']['score']} "
+                  f"{f['severity']['category']}, resilience {f['resilience']['score']} (via {f['source']['mode']})")
+    return rc
+
+
+def cmd_score(a) -> int:
+    o = pipeline.findings_summary(Store())["overall"]
+    if a.json:
+        print(json.dumps(o, indent=2))
+        return 0
+    print(f"Overall resilience: {'n/a' if o['score'] is None else str(o['score']) + '/100'}"
+          + ("  (capped: unrecovered experiment)" if o["capped_unrecovered"] else ""))
+    print(f"Coverage: {o['scenarios_scored']}/{o['scenarios_total']} scenarios; "
+          f"{o['experiments_analysed']} experiments analysed {o['counts']}")
+    for k, v in o["components"].items():
+        print(f"  {k:<13} {'n/a' if v is None else format(v, '.0%')}  (weight {o['weights'][k]:.0%})")
+    for sc in o["per_scenario"]:
+        print(f"  {sc['fault_type']:<17} {sc['target']:<7} resilience {sc['resilience']}  severity "
+              f"{sc['severity']} {sc['severity_category']}  [{sc['status']}] {sc['run_id']}")
+    for ft, t in o["untested_scenarios"]:
+        print(f"  {ft:<17} {t:<7} not tested")
+    print(o["note"])
+    return 0
+
+
+def cmd_export(a) -> int:
+    store = Store()
+    ids = _run_ids(store, a.run_id)
+    for rid in ids:
+        path = export_run(store, rid, a.dir)
+        print(path if path else f"{rid}: not an experiment run")
+    return 0 if ids else 1
+
+
+def cmd_retest(a) -> int:
+    """Re-run an earlier experiment with the same configuration (after a
+    human has applied a fix) and compare the two findings."""
+    e = _engine()
+    e.recover_on_startup()
+    store = e.store
+    ids = _run_ids(store, a.run_id)
+    old = store.get_run(ids[0]) if ids else None
+    if not old or old["kind"] != "experiment":
+        print("no such experiment run")
+        return 1
+    prov, graph = _provider(a), discover(e.docker)
+    if not store.get_analysis(old["id"]):
+        pipeline.analyze_and_export(store, old["id"], graph, prov)
+    try:
+        run_id = e.start(ExperimentConfig.model_validate(old["config"]))
+    except ExperimentRejected as ex:
+        print("REJECTED:", "; ".join(ex.errors))
+        return 2
+    print(f"retest of {old['id']} as {run_id}")
+    _follow(e, run_id)
+    f = pipeline.analyze_and_export(store, run_id, graph, prov)
+    print(format_report(store.get_run(run_id)))
+    print(format_analysis(f))
     return 0
 
 
@@ -251,7 +443,10 @@ def cmd_serve(a) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="python -m chaos", description="Paperless-ngx chaos sandbox (Day 1)")
+    for stream in (sys.stdout, sys.stderr):  # reports use non-ASCII marks; Windows consoles default to cp1252
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    ap = argparse.ArgumentParser(prog="python -m chaos", description="Paperless-ngx chaos lab")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("up", help="generate secrets, build helper image, start the sandbox").set_defaults(fn=cmd_up)
     p = sub.add_parser("down", help="roll back any fault and stop the sandbox")
@@ -279,9 +474,35 @@ def main(argv=None) -> int:
     sub.add_parser("kill", help="KILL SWITCH: abort and remove all faults").set_defaults(fn=cmd_kill)
     sub.add_parser("rollback", help="emergency rollback without a running controller").set_defaults(fn=cmd_rollback)
     sub.add_parser("unblock", help="verify environment and clear the BLOCKED state").set_defaults(fn=cmd_unblock)
-    p = sub.add_parser("report", help="print an experiment report")
+    p = sub.add_parser("report", help="experiment report (run id | latest) or the final 'findings' report")
     p.add_argument("run_id", nargs="?", default="latest")
+    p.add_argument("--out", help="write the report to this file")
     p.set_defaults(fn=cmd_report)
+    prov = {"help": "ollama | anthropic | openai | none (default: CHAOS_LLM_PROVIDER or auto)"}
+    p = sub.add_parser("plan", help="AI planner: rank experiments worth running")
+    p.add_argument("--show", action="store_true", help="show the latest plan instead of creating one")
+    p.add_argument("--provider", **prov)
+    p.set_defaults(fn=cmd_plan)
+    p = sub.add_parser("plan-run", help="run approved plan recommendations one after another, then analyse")
+    p.add_argument("plan_id", nargs="?", default="latest")
+    p.add_argument("--ranks", help="comma-separated ranks to run (default: all)")
+    p.add_argument("--provider", **prov)
+    p.set_defaults(fn=cmd_plan_run)
+    p = sub.add_parser("analyze", help="AI analyst: diagnose a finished experiment (run id | latest | all)")
+    p.add_argument("run_id", nargs="?", default="latest")
+    p.add_argument("--provider", **prov)
+    p.set_defaults(fn=cmd_analyze)
+    p = sub.add_parser("score", help="overall resilience score and coverage")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_score)
+    p = sub.add_parser("export", help="write one JSON evidence file per experiment (run id | latest | all)")
+    p.add_argument("run_id", nargs="?", default="all")
+    p.add_argument("--dir", default=None, help="target directory (default: data/exports)")
+    p.set_defaults(fn=cmd_export)
+    p = sub.add_parser("retest", help="re-run an experiment with the same config and compare findings")
+    p.add_argument("run_id", nargs="?", default="latest")
+    p.add_argument("--provider", **prov)
+    p.set_defaults(fn=cmd_retest)
     p = sub.add_parser("runs", help="list recorded runs")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(fn=cmd_runs)

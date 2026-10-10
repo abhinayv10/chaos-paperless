@@ -20,3 +20,28 @@ Additional safety checks on the live stack:
 - **Unit tests:** `pytest -q` → 54 passed.
 
 Not verified live: the `network_latency` fault (implemented, and its preflight requires the netem image) and an actual controller crash mid-fault (covered by unit tests only).
+
+# Day 2 verification (2026-10-10, same machine and sandbox)
+
+These results also come from real runs. No LLM provider was available on this machine (no Ollama, no API key), so
+both agents ran in their deterministic `rules` mode. The LLM path is covered by unit tests with a fake provider only.
+
+| # | Day 2 step | Evidence |
+|---|---|---|
+| 1 | Discovery feeds the planner | `python -m chaos plan`: plan `plan-20261010-172932-4feb`, 4 ranked recommendations built from the live dependency map and 8 earlier runs. db pause ranked first (all 5 workflows pass through db; last run critical), broker latency second (never tested) |
+| 2 | Safety validation and sequential execution | `python -m chaos plan-run latest`: 4 experiments in sequence, each with its own preflight (13/13), baseline, watchdog, verified rollback and verified recovery. Sequence `completed` |
+| 3 | Controlled faults with observed impact | `exp-…172934-9b10` db pause: aborted by threshold after 6 s, full impact. `exp-…173020-24c7` broker latency 300 ms: api_status 50% errors, document processing p95 1.1 s -> 13.4 s, reads unaffected. `exp-…173118-bd9b` db latency 300 ms: api_documents and api_status 100% errors. `exp-…173219-b1a2` broker pause: api_status and doc_upload failed, reads unaffected |
+| 4 | Diagnosis and recommended fix | Every run has a finding citing numbered facts, e.g. broker pause -> hypothesis "requests wait on broker with no effective timeout", fix category `timeout_configuration`, with success criteria |
+| 5 | Scoring | `python -m chaos score`: overall resilience 65.7/100, coverage 4/4 scenarios, 12 experiments analysed (4 completed, 8 aborted, 0 inconclusive, 0 unrecovered). Severity: db pause 80 critical, db latency 70 high, broker pause 50 high, broker latency 44 medium |
+| 6 | Report, export, API | `python -m chaos report findings` (7 sections), 12 files in `data/exports/`, and `/api/plan`, `/api/findings`, `/api/report` returned 200 from a live `serve`. A second `POST /api/plan` re-ranked on the new evidence (db latency moved from 3rd to 2nd) |
+| 7 | Safety preserved | After the sequence: `status` all PASS, not blocked, no active-fault marker. `webserver` target still rejected with 400; `POST /api/kill` returned `rollback_verified: true` |
+
+- **`network_latency` is now verified live** on both db and broker (it was not on Day 1).
+- **Unit tests:** `pytest -q` -> 122 passed (54 from Day 1, 68 new).
+- **Engine change:** recovery verification now also requires the newest sample of each recovery probe to be good.
+  The old rule could verify recovery on consecutive `api_status` successes while `api_documents` was still failing,
+  which made `test_unrecovered_application_blocks` fail about half the time.
+
+Not verified: a real LLM provider end to end, the new dashboard tabs in a browser (their API calls and element ids
+were checked, the rendering was not looked at), `retest` against the live sandbox, and a sequence stopping on a real
+BLOCKED state (unit tests only).

@@ -121,7 +121,7 @@ class FakeClient:
         return self._r("api_status", ["db", "broker"])
 
     def upload_document(self):
-        r = self._r("doc_upload", ["broker"])
+        r = self._r("doc_upload", ["db", "broker"])  # real uploads need db too (token auth)
         return r, (f"task-{next(self._ids)}" if r.ok else None)
 
     def task_status(self, task_id):

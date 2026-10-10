@@ -10,13 +10,15 @@
 <header class="topbar">
   <div class="brand">
     <strong>Paperless Chaos Lab</strong>
-    <span class="muted">Day 1 · sandbox <code>paperless-chaos</code></span>
+    <span class="muted">AI-driven chaos engineering · sandbox <code>paperless-chaos</code></span>
   </div>
   <nav class="tabs" role="tablist">
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="graph">Dependency Map</button>
+    <button data-tab="plan">AI Planner</button>
     <button data-tab="lab">Experiment Lab</button>
     <button data-tab="obs">Observability</button>
+    <button data-tab="findings">Findings</button>
   </nav>
   <div class="topstate">
     <span id="conn" class="pill">connecting…</span>
@@ -187,6 +189,13 @@
       <div class="tblwrap"><table class="tbl" id="obs-phases"><thead><tr><th>Phase</th><th>Probe</th><th>n</th><th>Errors</th><th>Error rate</th><th>p50</th><th>p95</th></tr></thead><tbody></tbody></table></div>
       <ul id="obs-impact" class="obs"></ul>
     </div>
+    <div class="card">
+      <div class="row between">
+        <h2>AI analysis <span class="muted small" id="obs-an-src"></span></h2>
+        <button id="obs-analyze">Analyse this run</button>
+      </div>
+      <div id="obs-analysis"><div class="muted">Select an experiment run.</div></div>
+    </div>
     <div class="grid cols-2">
       <div class="card">
         <h2>Fault removal &amp; recovery</h2>
@@ -200,6 +209,58 @@
         <h3 class="mt">Run events</h3>
         <div class="tblwrap scroll"><table class="tbl" id="obs-events"><thead><tr><th>Time</th><th>Event</th><th>Message</th></tr></thead><tbody></tbody></table></div>
       </div>
+    </div>
+  </section>
+  <!-- ======================================================== AI PLANNER -->
+  <section id="tab-plan" class="tab">
+    <div class="card">
+      <div class="row between">
+        <h2>Chaos Planner (Agent 1) <span class="muted small" id="pl-src"></span></h2>
+        <div class="row">
+          <span id="pl-ai" class="pill">AI: …</span>
+          <button id="pl-generate" class="primary">Generate ranked plan</button>
+        </div>
+      </div>
+      <p class="muted small">The planner reads the discovered dependency map, the experiment catalogue and earlier results, and proposes
+        ranked experiments. It cannot run anything: every recommendation is re-validated by the safety controller, and nothing
+        starts until you approve it below.</p>
+      <div id="pl-empty" class="empty" hidden>No plan yet. Generate one.</div>
+      <div class="tblwrap"><table class="tbl" id="pl-recs"><thead><tr><th></th><th>#</th><th>Experiment</th><th>Hypothesis and reason for this rank</th><th>Expected effects</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+      <div id="pl-rejected" class="banner warning" hidden></div>
+      <div class="row mt">
+        <button id="pl-run" class="primary">Approve &amp; run selected in sequence</button>
+        <span class="muted small">Runs one at a time; each run passes preflight first. The sequence stops if a run is rejected,
+          unrecovered or blocked, or when the kill switch is used.</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Sequence execution <span class="muted small" id="pl-exec-state"></span></h2>
+      <table class="tbl" id="pl-steps"><thead><tr><th>#</th><th>Experiment</th><th>Run</th><th>State</th><th>Result</th><th>Notes</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- ======================================================== FINDINGS -->
+  <section id="tab-findings" class="tab">
+    <div class="card">
+      <div class="row between">
+        <h2>Resilience score <span class="muted small">computed from measurements, never by the AI</span></h2>
+        <div class="row">
+          <button id="fd-analyze-all">Analyse unanalysed runs</button>
+          <a href="/api/report" target="_blank" class="small">final findings report ↗</a>
+        </div>
+      </div>
+      <div class="grid cols-4" id="fd-cards"></div>
+      <p class="muted small" id="fd-note"></p>
+      <table class="tbl" id="fd-scenarios"><thead><tr><th>Scenario</th><th>Run used</th><th>Run status</th><th>Resilience</th><th>Severity</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Ranked findings <span class="muted small">worst first · measured facts vs AI hypotheses are labelled</span></h2>
+      <div id="fd-empty" class="empty" hidden>No analysed experiment yet. Run an experiment, then analyse it.</div>
+      <div id="fd-list"></div>
+    </div>
+    <div class="card">
+      <h2>Scoring methodology</h2>
+      <pre class="logs" id="fd-method"></pre>
     </div>
   </section>
 </main>

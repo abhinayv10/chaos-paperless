@@ -100,3 +100,13 @@ pre.logs { background: var(--surface-2); padding: 8px; border-radius: 6px; font-
 ul.obs { margin: 10px 0 0; padding-left: 18px; }
 .hstrip { display: flex; height: 16px; border-radius: 3px; overflow: hidden; margin: 2px 0 8px; gap: 1px; background: var(--surface); }
 .hstrip span { flex: 1; min-width: 1px; }
+
+/* Day 2: planner + findings */
+.finding { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+.finding h3 { color: var(--text); font-size: 14px; }
+.finding ul { margin: 4px 0 8px; padding-left: 18px; }
+.tag { display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-2); margin-right: 4px; }
+.tag.ai { border-color: var(--accent); color: var(--accent); }
+.fact { color: var(--text-2); font-size: 12px; }
+.sev-critical { color: var(--critical); } .sev-high { color: var(--serious); } .sev-medium { color: #b07800; }
+.sev-low, .sev-none { color: var(--good); } .sev-inconclusive { color: var(--muted); }

@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY, value TEXT NOT NULL, updated REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY, created REAL NOT NULL, data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS analyses (
+    run_id TEXT PRIMARY KEY, created REAL NOT NULL, data TEXT NOT NULL
+);
 """
 
 RUN_JSON_FIELDS = ("config", "outcome", "summary")
@@ -175,6 +181,47 @@ class Store:
             d["data"] = json.loads(d["data"]) if d["data"] else None
             out.append(d)
         return out
+
+    # ---- planner output and analyst findings ----------------------------------
+    def save_plan(self, plan: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO plans (id, created, data) VALUES (?,?,?)"
+                " ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                (plan["id"], plan.get("created") or time.time(), json.dumps(plan)),
+            )
+
+    def get_plan(self, plan_id: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT data FROM plans WHERE id=?", (plan_id,)).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def list_plans(self, limit: int = 20) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT data FROM plans ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
+    def latest_plan(self) -> Optional[dict]:
+        plans = self.list_plans(1)
+        return plans[0] if plans else None
+
+    def save_analysis(self, run_id: str, analysis: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO analyses (run_id, created, data) VALUES (?,?,?)"
+                " ON CONFLICT(run_id) DO UPDATE SET data=excluded.data, created=excluded.created",
+                (run_id, time.time(), json.dumps(analysis)),
+            )
+
+    def get_analysis(self, run_id: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT data FROM analyses WHERE run_id=?", (run_id,)).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def list_analyses(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT data FROM analyses ORDER BY created").fetchall()
+        return [json.loads(r["data"]) for r in rows]
 
     # ---- key/value state (active run marker, blocked flag, kill request) ------
     def kv_get(self, key: str) -> Any:
