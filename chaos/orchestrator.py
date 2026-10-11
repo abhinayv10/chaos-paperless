@@ -24,11 +24,13 @@ SETTLE_S = 5.0
 
 class Orchestrator:
     def __init__(self, engine: Engine, store: Store,
-                 after_run: Optional[Callable[[str], None]] = None, settle_s: float = SETTLE_S):
+                 after_run: Optional[Callable[[str], None]] = None, settle_s: float = SETTLE_S,
+                 prepare: Optional[Callable] = None):
         self.engine = engine
         self.store = store
         self.after_run = after_run   # e.g. analyse + export; failures are recorded, not raised
         self.settle_s = settle_s
+        self.prepare = prepare       # e.g. switch the run to self-healing mode
         self._stop = threading.Event()
         self._stop_reason = ""
         self._thread: Optional[threading.Thread] = None
@@ -104,7 +106,8 @@ class Orchestrator:
             if stop_reason:
                 break
             try:
-                run_id = self.engine.start(to_config(rec))
+                cfg = to_config(rec)
+                run_id = self.engine.start(self.prepare(cfg) if self.prepare else cfg)
             except ExperimentRejected as e:
                 step.update(state="rejected", result="rejected", errors=e.errors)
                 rec["status"] = "rejected"

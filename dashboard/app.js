@@ -1,47 +1,49 @@
 "use strict";
-// Paperless Chaos Lab dashboard. Every value shown comes from the controller
-// API; when data is missing or the backend is unreachable we say so.
+// Paperless Chaos Lab dashboard. Two pages: Overview (the website, live) and
+// Scan & inject (the campaign, with the self-healing agent and the findings).
+// Every value shown comes from the controller API; when data is missing or the
+// backend is unreachable we say so.
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmtTime = (ts) => (ts ? new Date(ts * 1000).toLocaleTimeString() : "–");
+const hm = (t) => (t ? new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "–");
 const fmtMs = (v) => (v == null ? "–" : v >= 1000 ? (v / 1000).toFixed(1) + " s" : Math.round(v) + " ms");
 const fmtPct = (v) => (v == null ? "–" : (v * 100).toFixed(v > 0 && v < 0.1 ? 1 : 0) + "%");
+const fmtBytes = (b) => (b == null ? "–" : b >= 2 ** 30 ? (b / 2 ** 30).toFixed(2) + " GB" : Math.round(b / 2 ** 20) + " MB");
+const secs = (v) => (v == null ? "–" : `${v.toFixed(1)} s`);
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const PROBES = ["web_root", "api_documents", "api_status", "doc_upload"];
-// Plain names for what the probes and services are.
 const WORKFLOWS = { web_root: "Open the web UI", api_documents: "List documents", api_status: "System status check", doc_upload: "Upload a document", doc_processing: "Process a document" };
 const SERVICE = { db: "database", broker: "message broker", webserver: "web application", host: "users" };
 const PROBE_VAR = { web_root: "--s1", api_documents: "--s2", api_status: "--s3", doc_upload: "--s4" };
-const TERMINAL = ["completed", "aborted", "failed", "rejected", "interrupted"];
-
-let catalog = null, currentTab = "overview", safetyState = null, findingsData = null, planData = null, monitor = null;
-let planChecked = null, selectedRun = null, lastView = null, sequenceRunning = false;
-
 const svc = (id) => SERVICE[id] || id;
-// Generated text uses internal ids; show the plain names instead.
+
+let currentTab = "overview", safetyState = null, monitor = null, lastView = null, scoreData = null, aiInfo = null;
+
 function humanize(text) {
   return String(text ?? "")
     .replace(/\b(web_root|api_documents|api_status|doc_upload|doc_processing)\b/g, (m) => `"${WORKFLOWS[m]}"`)
-    .replace(/\bdb\b/g, "database").replace(/\bbroker\b/g, "message broker")
-    .replace(/\b(the|a|an) the /gi, "the ").replace(/ ?\(criticality reach [\d.]+\)/g, "").replace(/ ?Priority score [\d.]+\./g, "")
-    .replace(/ exp-\d{8}-\d{6}-[0-9a-f]{4}/g, "");
+    .replace(/\bdb\b/g, "database").replace(/(?<!message )\bbroker\b/gi, "message broker")
+    .replace(/\b(the|a|an) the /gi, "the ").replace(/ exp-\d{8}-\d{6}-[0-9a-f]{4}/g, "");
 }
-const isLatency = (c) => c.fault_type === "network_latency";
-// "Database pause" / "Message broker +300 ms latency"
-const faultTitle = (c) => (c && c.target ? `${cap(svc(c.target))} ${isLatency(c) ? `${c.latency_ms ? "+" + c.latency_ms + " ms " : ""}latency` : "pause"}` : "Experiment");
-// "Pausing the database" / "Slowing the database by 300 ms"
-const faultDoing = (c) => (isLatency(c) ? `Slowing the ${svc(c.target)} by ${c.latency_ms} ms` : `Pausing the ${svc(c.target)}`);
-const faultIs = (c) => (isLatency(c) ? `The ${svc(c.target)} is answering ${c.latency_ms} ms slower` : `The ${svc(c.target)} is frozen`);
+const faultName = (c) => ({ dependency_pause: "freeze (pause)", dependency_stop: "crash (stop)", network_latency: `${c.latency_ms ? "+" + c.latency_ms + " ms " : ""}latency`,
+  packet_loss: `${c.loss_pct ?? ""}% packet loss`, cpu_exhaustion: `CPU capped at ${c.cpu_limit ?? "?"}`,
+  connection_refused: "connections refused", memory_exhaustion: `memory squeezed to ${c.memory_mb ?? "?"} MB`,
+  disk_exhaustion: "upload disk full" }[c.fault_type] || c.fault_type);
+const faultTitle = (c) => (c && c.target ? (c.fault_type === "disk_exhaustion" ? "Upload disk full" : `${cap(svc(c.target))} ${faultName(c)}`) : "Experiment");
+const faultIs = (c) => ({ dependency_pause: `The ${svc(c.target)} is frozen`, dependency_stop: `The ${svc(c.target)} is stopped`,
+  network_latency: `The ${svc(c.target)} answers ${c.latency_ms} ms slower`, packet_loss: `The ${svc(c.target)} is losing ${c.loss_pct}% of its packets`,
+  cpu_exhaustion: `The ${svc(c.target)} is capped at ${c.cpu_limit} CPU`, connection_refused: `Every connection to the ${svc(c.target)} is refused`,
+  memory_exhaustion: `The ${svc(c.target)} is squeezed into ${c.memory_mb} MB of memory`, disk_exhaustion: "The upload disk is full" }[c.fault_type] || `The ${svc(c.target)} is disturbed`);
 
 // ---------------------------------------------------------------- utilities
 async function api(path, opts = {}) {
   const init = { headers: { "Content-Type": "application/json" }, ...opts };
   if (init.body && typeof init.body !== "string") init.body = JSON.stringify(init.body);
   let res;
-  try { res = await fetch(path, init); } catch (e) { setConn(false); throw new Error("controller unreachable"); }
-  setConn(true);
+  try { res = await fetch(path, init); } catch (e) { setPill(false); throw new Error("controller unreachable"); }
   const text = await res.text();
   let data; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!res.ok) {
@@ -57,7 +59,14 @@ function describeError(d) {
   if (d.errors) return d.errors.join("; ");
   return typeof d === "string" ? d : "";
 }
-function setConn(ok) { $("#conn").innerHTML = chip(ok ? "connected" : "controller unreachable", ok ? "good" : "critical"); }
+// One status pill for the whole app: connection, active fault, AI model.
+function setPill(ok) {
+  const el = $("#state-pill");
+  if (!ok) { el.innerHTML = chip("Controller unreachable", "critical"); return; }
+  const fault = safetyState && safetyState.active_fault;
+  const ai = aiInfo && aiInfo.provider ? `AI: ${aiInfo.model}` : "AI: rules only";
+  el.innerHTML = fault ? chip(`Fault active on the ${svc(fault.service)} · ${ai}`, "serious") : chip(`Connected · ${ai}`, aiInfo && aiInfo.provider ? "good" : "warning");
+}
 let toastTimer;
 function toast(msg, ms = 5000) {
   const t = $("#toast"); t.textContent = msg; t.hidden = false;
@@ -67,15 +76,13 @@ function toast(msg, ms = 5000) {
 const chip = (label, tone) => `<span class="status st-${tone || "unknown"}">${esc(label)}</span>`;
 function toneOf(s) {
   s = String(s || "").toLowerCase();
-  if (["healthy", "running", "ok", "completed", "executed", "external", "recovered"].includes(s)) return "good";
-  if (["starting", "baseline", "preflight", "observing", "verifying_recovery", "rolling_back", "aborted", "skipped"].includes(s)) return "warning";
-  if (["unhealthy", "injecting", "active"].includes(s)) return "serious";
-  if (["paused", "exited", "dead", "missing", "failed", "rejected", "interrupted", "stopped"].includes(s)) return "critical";
+  if (["healthy", "running", "ok", "completed", "external", "recovered"].includes(s)) return "good";
+  if (["starting", "restarting"].includes(s)) return "warning";
+  if (["unhealthy"].includes(s)) return "serious";
+  if (["paused", "exited", "dead", "missing"].includes(s)) return "critical";
   return "unknown";
 }
 const SEV_TONE = { critical: "critical", high: "serious", medium: "warning", low: "good", none: "good", inconclusive: "unknown" };
-const sevChip = (s) => chip(s.score == null ? "Inconclusive" : `${cap(s.category)} (${Math.round(s.score)}/100)`, SEV_TONE[s.category]);
-const SCOPE = { full: ["Full outage", "critical"], partial: ["Partial", "warning"], none: ["No impact", "good"], inconclusive: ["Inconclusive", "unknown"] };
 function rows(tbody, html, cols, emptyMsg) {
   tbody.innerHTML = html.length ? html.join("") : `<tr><td colspan="${cols}" class="muted">${esc(emptyMsg)}</td></tr>`;
 }
@@ -84,7 +91,11 @@ function pctl(values, p) {
   const s = [...values].sort((a, b) => a - b);
   return s[Math.max(0, Math.min(s.length - 1, Math.ceil((p / 100) * s.length) - 1))];
 }
-const list = (a) => (a.length <= 1 ? a.join("") : a.slice(0, -1).join(", ") + " and " + a[a.length - 1]);
+function since(iso) {
+  const t = Date.parse(iso); if (!t) return "–";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  return s < 120 ? `${Math.round(s)} s` : s < 7200 ? `${Math.round(s / 60)} m` : `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} m`;
+}
 
 // ---------------------------------------------------------------- tabs, kill switch, unblock
 $$(".tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
@@ -112,39 +123,25 @@ $("#unblock").addEventListener("click", async () => {
   refreshAll();
 });
 
-// ---------------------------------------------------------------- the experiment on screen
-// One shape for it: the live run if this controller has one, otherwise the
-// most recent recorded experiment.
+// ---------------------------------------------------------------- the experiment on the Overview
+// The live run if there is one, otherwise the most recent recorded experiment.
 let lastRunCache = { key: null, run: null };
 async function getView() {
   const d = await api("/api/experiments/current");
   const live = d.live || {};
   if (live.run_id && live.kind === "experiment") {
-    const ev = live.events || [];
-    const find = (k) => ev.find((e) => e.kind === k);
-    const rec = find("recovery_verified"), recFail = find("recovery_failed");
-    const m = rec && /recovered ([\d.]+)s/.exec(rec.message);
-    return {
-      busy: d.busy, source: "live", run_id: live.run_id, state: live.state, config: live.config || {}, message: live.message,
-      fault_start: live.fault_start, fault_end: live.fault_end, planned_end: live.planned_end, samples: live.samples || [], events: ev,
-      breaches: live.breaches || [], result: live.result,
-      removal: find("fault_removed") ? true : find("rollback_failed") ? false : null,
-      recovery: { verified: rec ? true : recFail ? false : null, time: m ? +m[1] : null, note: (rec || recFail || {}).message },
-    };
+    return { busy: d.busy, source: "live", run_id: live.run_id, state: live.state, config: live.config || {},
+      fault_start: live.fault_start, fault_end: live.fault_end, samples: live.samples || [], events: live.events || [] };
   }
-  if (d.busy) return { busy: true, source: "other", state: live.state || "running", config: live.config || {}, samples: [], events: [], message: live.message || "A baseline or another controller is running.", recovery: {}, breaches: [] };
+  if (d.busy) return { busy: true, source: "other", state: live.state || "running", config: live.config || {}, samples: [], events: [] };
   const runs = await api("/api/runs?kind=experiment&limit=10");
   const head = runs.find((r) => r.state !== "rejected");
   if (!head) return null;
   const key = head.id + head.state + head.ended;
   if (lastRunCache.key !== key) lastRunCache = { key, run: await api("/api/runs/" + encodeURIComponent(head.id)) };
   const r = lastRunCache.run, o = r.outcome || {}, rec = o.recovery || {};
-  return {
-    busy: false, source: "last", run_id: r.id, state: r.state, config: r.config || {}, fault_start: r.fault_start, fault_end: r.fault_end,
-    samples: r.samples || [], events: r.events || [], breaches: o.breaches || [], result: o.result, message: o.abort_reason || "",
-    removal: (o.fault_removal || {}).verified ?? null,
-    recovery: { verified: rec.verified ?? null, time: rec.recovery_time_s ?? null, note: rec.notes },
-  };
+  return { busy: false, source: "last", run_id: r.id, state: r.state, config: r.config || {}, fault_start: r.fault_start, fault_end: r.fault_end,
+    samples: r.samples || [], events: r.events || [], recoveredAt: rec.recovery_time_s != null && r.fault_end ? r.fault_end + rec.recovery_time_s : null };
 }
 function phaseStats(samples, probes, phases) {
   const r = samples.filter((s) => probes.includes(s.probe) && phases.includes(s.phase));
@@ -158,132 +155,99 @@ function verdict(st, base) {
   if (base && base.p95 && st.p95 > 2 * base.p95 && st.p95 - base.p95 > 200) return ["Slower", "warning"];
   return ["OK", "good"];
 }
-// Per-workflow effect, computed from this run's samples.
-function workflowRows(v) {
-  return Object.entries(WORKFLOWS).map(([p, label]) => {
-    const base = phaseStats(v.samples, [p], ["baseline"]), fault = phaseStats(v.samples, [p], ["fault"]), after = phaseStats(v.samples, [p], ["recovery", "post"]);
-    return { p, label, base, fault, after, vb: verdict(base), vf: verdict(fault, base), va: verdict(after, base) };
-  });
-}
-// How many workflows broke / slowed. Uses the backend's analysis when the run has one.
-function impactCounts(v) {
-  const f = findingsData && findingsData.findings.find((x) => x.run_id === v.run_id);
-  if (f && f.deterministic.impact !== "inconclusive") return { failed: f.deterministic.failed.map((w) => WORKFLOWS[w]), slowed: f.deterministic.degraded.map((w) => WORKFLOWS[w]), total: f.deterministic.workflows.filter((w) => w.status !== "no_data").length, analysed: true };
-  const r = workflowRows(v).filter((w) => w.vf);
-  return { failed: r.filter((w) => w.vf[0] === "Failing").map((w) => w.label), slowed: r.filter((w) => ["Slower", "Some errors"].includes(w.vf[0])).map((w) => w.label), total: r.length, analysed: false };
-}
-// Headline status. "Recovered" is only ever shown when the backend has verified recovery.
-function statusOf(v) {
-  if (safetyState && safetyState.blocked) return { label: "Blocked", tone: "critical" };
-  if (!v) return { label: "Ready", tone: "good" };
-  const s = v.state;
-  if (v.source === "other" || s === "preflight" || s === "baseline") return { label: "Running", tone: "warning" };
-  if (s === "injecting" || s === "active") return { label: "Fault active", tone: "serious" };
-  if (s === "rolling_back" || s === "verifying_recovery") return { label: "Recovering", tone: "warning" };
-  if (s === "observing") return { label: "Recovered", tone: "good" };
-  if (s === "failed") return { label: "Failed", tone: "critical" };
-  if (s === "interrupted") return { label: "Interrupted", tone: "critical" };
-  if (!v.fault_start) return { label: "Ready", tone: "good" };
-  if (v.recovery.verified === true) return { label: "Recovered", tone: "good" };
-  return { label: "Finished", tone: "unknown" };
-}
-function heroText(v, st) {
-  if (st.label === "Blocked") return `${safetyState.blocked.reason}. No experiment can start until the environment has been verified.`;
-  if (!v) return "No experiment has run yet. Generate a plan and run it to see how the application copes with failure.";
-  if (v.source === "other") return v.message;
-  const c = v.config, s = v.state;
-  if (s === "preflight" || s === "baseline") return `Measuring normal behaviour before the fault. Next: ${faultDoing(c).toLowerCase()} for ${c.duration_s} seconds.`;
-  if (s === "injecting" || s === "active") return `${faultIs(c)}. Watching how the application reacts.`;
-  if (s === "rolling_back") return `Removing the fault from the ${svc(c.target)}.`;
-  if (s === "verifying_recovery") return "The fault has been removed. Checking that the application works again.";
-  if (s === "failed") return `${faultDoing(c)}: the fault removal or the recovery could NOT be verified.`;
-  if (s === "interrupted") return `${faultDoing(c)}: the controller stopped in the middle of this run.`;
-  if (!v.fault_start) return `The last run stopped before any fault was injected (${v.message || v.result || s}).`;
-  const k = impactCounts(v);
-  const effect = !k.total ? "had no measurable effect"
-    : k.failed.length ? `broke ${k.failed.length} of ${k.total} user workflows` + (k.slowed.length ? ` and slowed ${k.slowed.length} more` : "")
-    : k.slowed.length ? `slowed ${k.slowed.length} of ${k.total} user workflows` : "had no effect on any user workflow";
-  const rec = v.recovery.verified === true ? ` The application recovered${v.recovery.time != null ? ` ${v.recovery.time.toFixed(1)} seconds` : ""} after the fault was removed.`
-    : s === "observing" ? "" : " Recovery has not been confirmed.";
-  return `${faultDoing(c)} ${effect}.${rec}`;
-}
-// The five-step story of one experiment.
-function story(v) {
-  const todo = (title, hint) => ({ title, value: "–", note: hint, cls: "todo" });
-  if (!v || v.source === "other") return [todo("Baseline", "measure normal behaviour"), todo("Inject fault", "pause or slow a dependency"), todo("Observe impact", "errors and slow-downs"), todo("Roll back", "remove the fault"), todo("Recover", "verify the app works again")];
-  const c = v.config, s = v.state, now = Date.now() / 1000, done = TERMINAL.includes(s);
-  const base = phaseStats(v.samples, PROBES, ["baseline"]), fault = phaseStats(v.samples, PROBES, ["fault"]);
-  const injected = !!v.fault_start, removed = !!v.fault_end;
-  const steps = [];
-  steps.push({ title: "Baseline", value: base ? `${fmtPct(base.err)} errors` : "measuring…", note: base ? `normal response time ${fmtMs(base.p95)}` : "normal behaviour before the fault",
-    cls: injected || done ? "done" : "now" });
-  const secs = injected ? (v.fault_end || now) - v.fault_start : null;
-  steps.push(!injected ? todo("Inject fault", `${faultTitle(c)}, ${c.duration_s} s`) : { title: "Fault injected", value: isLatency(c) ? `+${c.latency_ms} ms on ${c.target}` : `${cap(c.target)} frozen`,
-    note: removed ? `active for ${secs.toFixed(0)} s of ${c.duration_s} s planned` : `active for ${secs.toFixed(0)} s of at most ${c.duration_s} s`, cls: removed ? "done" : "now" });
-  if (!injected) steps.push(todo("Observe impact", "errors and slow-downs"));
-  else {
-    const k = impactCounts(v);
-    const value = !fault ? "watching…" : k.failed.length || k.slowed.length ? [k.failed.length ? `${k.failed.length} failing` : "", k.slowed.length ? `${k.slowed.length} degraded` : ""].filter(Boolean).join(", ") : removed ? "no impact" : "none so far";
-    steps.push({ title: "Impact observed", value, note: v.breaches.length ? "stopped early by the safety threshold" : fault ? `failed requests ${fmtPct(base && base.err)} → ${fmtPct(fault.err)}` : "waiting for requests to finish",
-      cls: !removed ? "now" : k.failed.length ? "done bad" : "done" });
-  }
-  steps.push(!removed ? todo("Roll back", "remove the fault") : v.removal === true ? { title: "Rolled back", value: "Fault removed", note: `verified at ${fmtTime(v.fault_end)}`, cls: "done" }
-    : v.removal === false ? { title: "Roll back", value: "NOT verified", note: "the fault may still be present", cls: "done bad" } : { title: "Rolling back", value: "removing…", note: "", cls: "now" });
-  steps.push(!removed ? todo("Recover", "verify the app works again") : v.recovery.verified === true ? { title: "Recovered", value: v.recovery.time != null ? `in ${v.recovery.time.toFixed(1)} s` : "verified", note: "application healthy again (verified)", cls: "done" }
-    : v.recovery.verified === false ? { title: "Recovery", value: "NOT verified", note: v.recovery.note || "", cls: "done bad" } : { title: "Recovering", value: "checking…", note: "waiting for healthy responses", cls: "now" });
-  return steps;
-}
-function renderStory(el, steps) {
-  el.innerHTML = steps.map((s, i) => `<li class="${s.cls}"><span class="n">${s.cls.includes("done") ? (s.cls.includes("bad") ? "!" : "✓") : i + 1}</span><div><div class="t">${esc(s.title)}</div><div class="v">${esc(s.value)}</div><div class="h">${esc(s.note)}</div></div></li>`).join("");
-}
-function renderWorkflows(el, v) {
-  if (!v || v.source === "other" || !v.samples.length) { el.innerHTML = `<div class="empty">No measurements yet.</div>`; return; }
+function renderWorkflows(el, samples) {
+  if (!samples || !samples.length) { el.innerHTML = `<div class="empty">No measurements yet.</div>`; return; }
   const c = (vd, st) => (vd ? `<td title="${fmtPct(st.err)} of requests failed · response time ${fmtMs(st.p95)}">${chip(vd[0], vd[1])} <span class="small muted">${st.err > 0 ? fmtPct(st.err) + " errors" : fmtMs(st.p95)}</span></td>` : `<td class="muted">–</td>`);
   el.innerHTML = `<table class="tbl wf"><thead><tr><th>Workflow</th><th>Before</th><th>During the fault</th><th>After</th></tr></thead><tbody>`
-    + workflowRows(v).map((w) => `<tr><td><b>${esc(w.label)}</b></td>${c(w.vb, w.base)}${c(w.vf, w.fault)}${c(w.va, w.after)}</tr>`).join("") + `</tbody></table>`;
+    + Object.entries(WORKFLOWS).map(([p, label]) => {
+      const base = phaseStats(samples, [p], ["baseline"]), fault = phaseStats(samples, [p], ["fault"]), after = phaseStats(samples, [p], ["recovery", "post"]);
+      return `<tr><td><b>${esc(label)}</b></td>${c(verdict(base), base)}${c(verdict(fault, base), fault)}${c(verdict(after, base), after)}</tr>`;
+    }).join("") + `</tbody></table>`;
 }
 
-// ---------------------------------------------------------------- overview
+// ---------------------------------------------------------------- overview: status, metrics, resources
 const LOG = {
   preflight_passed: ["Preflight passed", "good"], fault_injected: ["Fault injected", "serious"],
   threshold_breach: ["Automatic abort", "critical"], manual_abort: ["Aborted by kill switch", "warning"], kill_switch: ["Kill switch", "warning"],
-  fault_removed: ["Rollback verified", "good"], rollback_failed: ["Rollback FAILED", "critical"], recovery_verified: ["Recovery verified", "good"],
+  fault_removed: ["Fault removed (verified)", "good"], rollback_failed: ["Rollback FAILED", "critical"], recovery_verified: ["Recovery verified", "good"],
   recovery_failed: ["Recovery NOT verified", "critical"], blocked: ["Experiments blocked", "critical"], unblocked: ["Unblocked", "warning"],
   finished: ["Run finished", "unknown"], analysis_done: ["Analysed", "unknown"], aborted: ["Aborted", "warning"], rejected: ["Rejected by safety", "warning"],
   kill_rollback: ["Kill-switch rollback", "warning"], controller_error: ["Controller error", "critical"], fault_error: ["Fault error", "critical"],
+  agent_watching: ["Agent watching", "unknown"], agent_remediated: ["Agent fixed it", "good"], agent_fix_ineffective: ["Agent fix ineffective", "warning"],
+  threshold_breach_observed: ["Threshold breached (held for agent)", "warning"], agent_error: ["Agent error", "critical"],
 };
 function renderLog(v) {
   const events = v && v.events.length ? v.events : (safetyState ? safetyState.events : []);
   const out = events.filter((e) => LOG[e.kind]).sort((a, b) => b.ts - a.ts);
   rows($("#ov-log tbody"), out.slice(0, 20).map((e) => `<tr><td class="muted nowrap">${fmtTime(e.ts)}</td><td class="nowrap">${chip(...LOG[e.kind])}</td><td class="small">${esc(e.message)}</td></tr>`), 3, "no events yet");
 }
-function renderHero(v) {
-  const st = statusOf(v);
-  $("#hero-status").innerHTML = chip(st.label, st.tone);
-  $("#hero-text").textContent = heroText(v, st);
-  $("#story-title").textContent = !v || v.source === "other" ? "How an experiment works" : `${v.busy ? "Running now" : "Latest experiment"}: ${faultTitle(v.config)}`;
-  const busy = v && v.busy;
-  $("#hero-cta").textContent = busy ? "View experiments →" : "Run an experiment →";
-  const m = monitor || {}, svcs = m.services || [], bad = svcs.filter((s) => !s.ok);
-  const app = !m.ts ? chip("Application: waiting for first check", "unknown") : chip(m.app_ok ? "Application healthy" : "Application degraded", m.app_ok ? "good" : "critical");
-  const box = m.docker_error ? chip("Docker unreachable", "critical") : !svcs.length ? chip(m.ts ? "Sandbox not running" : "Sandbox: waiting", m.ts ? "critical" : "unknown")
-    : chip(bad.length ? `${bad.length} of ${svcs.length} containers unhealthy` : `All ${svcs.length} containers healthy`, bad.length ? "critical" : "good");
-  const safe = safetyState && safetyState.blocked ? chip("Safety: blocked", "critical") : safetyState && safetyState.active_fault ? chip(`Fault active on ${safetyState.active_fault.service}`, "serious") : chip("Safety controls armed", "good");
-  $("#hero-health").innerHTML = app + box + safe;
-}
 async function loadOverview() {
   let d;
-  try { d = await api("/api/overview"); } catch (e) { $("#hero-health").innerHTML = chip("Controller unreachable: " + e.message, "critical"); return; }
+  try { d = await api("/api/overview"); } catch (e) { $("#ov-status").innerHTML = chip("Controller unreachable", "critical"); $("#ov-text").textContent = e.message; return; }
   monitor = d.monitor; safetyState = d.safety;
+  setPill(true);
   $("#blocked-banner").hidden = !d.safety.blocked;
   if (d.safety.blocked) $("#blocked-reason").textContent = `${d.safety.blocked.reason} (${fmtTime(d.safety.blocked.ts)}). No experiment can start until the environment is verified.`;
 }
-function renderScore() {
-  if (!findingsData) return;
-  const o = findingsData.overall;
-  $("#hero-score").innerHTML = o.score == null ? `<span class="muted">n/a</span>` : `${Math.round(o.score)}<span class="of"> / 100</span>`;
-  $("#hero-cov").textContent = o.score == null ? "no scored experiment yet" : `${o.scenarios_scored} of ${o.scenarios_total} failure scenarios tested` + (o.capped_unrecovered ? " · capped: a run did not recover" : "");
+// The headline: application health, or what the running experiment is doing to it.
+function renderHealth(v) {
+  const m = monitor || {}, svcs = m.services || [];
+  let st, text;
+  if (safetyState && safetyState.blocked) { st = ["Experiments blocked", "critical"]; text = safetyState.blocked.reason; }
+  else if (m.docker_error) { st = ["Docker unreachable", "critical"]; text = m.docker_error; }
+  else if (v && v.source === "live" && ["injecting", "active"].includes(v.state)) { st = ["Fault active", "serious"]; text = `${faultIs(v.config)}. ${v.config.remediation === "agent" ? "The self-healing agent has to find and fix it." : ""}`; }
+  else if (v && v.source === "live") { st = ["Experiment running", "warning"]; text = `${faultTitle(v.config)}: ${String(v.state || "").replace(/_/g, " ")}.`; }
+  else if (!m.ts) { st = ["Waiting for the first check", "unknown"]; text = "The monitor checks the application every 5 s."; }
+  else if (!m.app_ok) { st = ["Application degraded", "critical"]; text = (m.probes || []).filter((p) => !p.ok).map((p) => `${WORKFLOWS[p.probe] || p.probe}: ${p.detail}`).join("; "); }
+  else { st = ["All systems healthy", "good"]; text = `Paperless-ngx is answering normally. No fault is active. Last checked ${fmtTime(m.ts)}, every 5 s.`; }
+  $("#ov-status").innerHTML = chip(st[0], st[1]);
+  $("#ov-text").textContent = text;
+  const order = ["webserver", "db", "broker"];
+  const comps = order.map((id) => svcs.find((s) => s.service === id)).filter(Boolean).map((s) => {
+    const state = s.state === "running" ? (s.health === "none" ? "running" : s.health) : s.state;
+    return `<li>${chip(cap(svc(s.service)), toneOf(state))}<span class="small muted">${s.state === "running" ? "up " + since(s.started_at) : esc(state)}</span></li>`;
+  });
+  if (metricsData && metricsData.disk) comps.push(`<li>${chip("Upload disk", metricsData.disk.used_pct >= 90 ? "critical" : "good")}<span class="small muted">${metricsData.disk.used_pct}% of ${metricsData.disk.total_mb} MB</span></li>`);
+  $("#ov-comps").innerHTML = comps.join("") || `<li class="muted small">no containers found</li>`;
 }
+function renderScore() {
+  if (!scoreData) return;
+  const o = scoreData.overall;
+  $("#ov-score").innerHTML = o.score == null ? `<span class="muted">n/a</span>` : `${Math.round(o.score)}<small> / 100</small>`;
+  $("#ov-cov").textContent = o.score == null ? "no experiment scored yet" : `${o.scenarios_scored} of ${o.scenarios_total} failure scenarios tested`;
+}
+let metricsData = null;
+function spark(values, colorVar) {
+  const v = (values || []).map((x) => +x || 0);
+  if (v.length < 2) return `<div class="spark empty-spark"></div>`;
+  const w = 160, h = 30, lo = Math.min(...v), hi = Math.max(...v), span = hi - lo || 1;
+  const pts = v.map((y, i) => [i / (v.length - 1) * (w - 4) + 2, h - 4 - (y - lo) / span * (h - 8)]);
+  const line = pts.map((p) => p.map((n) => n.toFixed(1)).join(",")).join(" "), last = pts[pts.length - 1], c = `var(${colorVar})`;
+  return `<div class="spark"><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><polygon points="2,${h - 2} ${line} ${w - 2},${h - 2}" fill="${c}" opacity=".12"/><polyline points="${line}" fill="none" stroke="${c}" stroke-width="1.6"/><circle cx="${last[0]}" cy="${last[1]}" r="2.6" fill="${c}"/></svg></div>`;
+}
+async function loadMetrics() {
+  try { metricsData = await api("/api/metrics"); } catch { return; }
+  const m = metricsData, rq = m.requests, t = m.trend;
+  const tile = (k, v, unit, trend, color, note) => `<div class="metric"><div class="k">${k}</div><div class="v">${v}${unit ? `<small>${unit}</small>` : ""}</div>${spark(trend, color)}<div class="small muted">${note}</div></div>`;
+  const dc = m.documents.change;
+  $("#ov-metrics").innerHTML =
+    tile("Requests answered", rq.per_min ?? "–", "/min", t.rpm, "--s1", "lab traffic, last 15 min")
+    + tile("Error rate", rq.error_rate == null ? "–" : (rq.error_rate * 100).toFixed(1), "%", t.error_rate, rq.error_rate ? "--critical" : "--good", `${rq.failed} failed of ${rq.total}`)
+    + tile("Median response", rq.median_ms == null ? "–" : (rq.median_ms / 1000).toFixed(1), " s", t.median_ms, "--s3", `p95 ${fmtMs(rq.p95_ms)} · timeout ${m.client_timeout_s} s`)
+    + tile("Documents stored", m.documents.count ?? "–", "", m.documents.trend, "--s2", dc == null ? "count from the Paperless API" : `${dc >= 0 ? "+" : ""}${dc} in the last 15 min`)
+    + tile("Upload → processed", m.processing.median_ms == null ? "–" : (m.processing.median_ms / 1000).toFixed(1), " s", t.processing_ms, "--s4", m.processing.count ? `median of the last ${m.processing.count} documents` : "no uploads in the last 6 h")
+    + tile("Task queue", m.queue.length ?? "–", "", m.queue.trend, "--s1", "waiting for the worker");
+  const res = m.resources || {}, order = ["webserver", "db", "broker"];
+  const bar = (pct) => `<span class="mbar"><i style="width:${Math.min(100, Math.max(1, pct))}%"></i></span>`;
+  rows($("#ov-res tbody"), order.filter((s) => res[s]).map((s) => {
+    const r = res[s];
+    const memPct = r.memory_limit ? (r.mem_bytes / r.memory_limit) * 100 : r.mem_total_bytes ? (r.mem_bytes / r.mem_total_bytes) * 100 : 0;
+    const limits = [r.cpu_limit ? `${r.cpu_limit} CPU` : "", r.memory_limit ? `${fmtBytes(r.memory_limit)} memory` : ""].filter(Boolean).join(", ") || "none";
+    return `<tr><td><b>${esc(cap(svc(s)))}</b></td><td>${bar(r.cpu_pct)} <span class="num small">${r.cpu_pct.toFixed(1)}%</span></td><td>${bar(memPct)} <span class="num small">${fmtBytes(r.mem_bytes)}</span></td><td class="small ${limits === "none" ? "muted" : ""}">${esc(limits)}</td></tr>`;
+  }), 4, "Collecting resource use…");
+}
+async function loadScore() { try { scoreData = await api("/api/findings"); renderScore(); } catch { /* shown as n/a */ } }
+async function loadAi() { try { aiInfo = await api("/api/ai/status"); setPill(true); } catch { /* pill shows the problem */ } }
 async function loadGraph() {
   let g;
   try { g = await api("/api/graph"); } catch (e) { $("#ov-graph").innerHTML = `<div class="empty">Discovery failed: ${esc(e.message)}</div>`; return; }
@@ -355,11 +319,15 @@ function latencyChart(el, samples, opts = {}) {
   const sx = (t) => m.l + ((t - t0) / Math.max(1, t1 - t0)) * (W - m.l - m.r);
   const sy = (v) => H - m.b - (v / ymax) * (H - m.t - m.b);
   let g = bands(sx, { ...opts, tEnd: t1 }, m.t, H - m.t - m.b);
+  (opts.marks || []).filter((k) => k.t >= t0 && k.t <= t1).forEach((k, i) => {
+    const x = sx(k.t);
+    g += `<line x1="${x}" x2="${x}" y1="${m.t}" y2="${H - m.b}" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 3"/><text x="${x + 4}" y="${m.t + 32 + i * 15}" font-size="12" font-weight="600" fill="var(--accent)">${esc(k.label)}</text>`;
+  });
   for (let i = 0; i <= 4; i++) {
     const v = (ymax / 4) * i, y = sy(v);
     g += `<line x1="${m.l}" x2="${W - m.r}" y1="${y}" y2="${y}" stroke="var(--grid)"/><text x="${m.l - 6}" y="${y + 4}" text-anchor="end" font-size="12" fill="var(--muted)">${fmtMs(v)}</text>`;
   }
-  for (const t of timeTicks(t0, t1)) g += `<text x="${sx(t)}" y="${H - 8}" text-anchor="middle" font-size="12" fill="var(--muted)">${new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</text>`;
+  for (const t of timeTicks(t0, t1)) g += `<text x="${sx(t)}" y="${H - 8}" text-anchor="middle" font-size="12" fill="var(--muted)">${hm(t)}</text>`;
   for (const p of probes) {
     const pts = data.filter((s) => s.probe === p).sort((a, b) => a.ts - b.ts);
     if (!pts.length) continue;
@@ -384,283 +352,323 @@ function latencyChart(el, samples, opts = {}) {
 }
 function showTip(ev, text) { const t = $("#tip"); t.textContent = text; t.hidden = false; t.style.left = Math.min(ev.clientX + 14, innerWidth - 380) + "px"; t.style.top = ev.clientY + 14 + "px"; }
 function hideTip() { $("#tip").hidden = true; }
-function legend(el) {
-  el.innerHTML = PROBES.map((p) => `<span><span class="sw" style="background:var(${PROBE_VAR[p]})"></span>${WORKFLOWS[p]}</span>`).join("") + `<span><b style="color:var(--critical)">✕</b> failed request</span><span><span class="sw" style="background:var(--fault-band);height:10px"></span>fault active</span>`;
+function legend(el, agentMarks) {
+  el.innerHTML = PROBES.map((p) => `<span><span class="sw" style="background:var(${PROBE_VAR[p]})"></span>${WORKFLOWS[p]}</span>`).join("")
+    + `<span><b style="color:var(--critical)">✕</b> failed request</span><span><span class="sw" style="background:var(--fault-band);height:10px"></span>fault active</span>`
+    + (agentMarks ? `<span><span class="sw" style="background:var(--accent)"></span>agent: detected / fix applied / verified</span>` : "");
 }
-function renderChart(v) {
+function renderOverviewRun(v) {
   const el = $("#chart-ov");
+  $("#wf-note").textContent = !v || v.source === "other" ? "" : `${v.source === "live" ? "running now" : "latest experiment"}: ${faultTitle(v.config)}`;
+  renderWorkflows($("#wf-ov"), v && v.source !== "other" ? v.samples : null);
   if (!v || v.source === "other" || !v.samples.length) { el.dataset.sig = ""; el.innerHTML = `<div class="empty">The chart appears when an experiment runs.</div>`; return; }
-  const sig = [v.run_id, v.samples.length, v.fault_end, v.recovery.time].join("|");
+  const sig = [v.run_id, v.samples.length, v.fault_end].join("|");
   if (el.dataset.sig === sig) return;   // unchanged: keep the hover state
   el.dataset.sig = sig;
-  latencyChart(el, v.samples, { faultStart: v.fault_start, faultEnd: v.fault_end, recoveredAt: v.recovery.time != null && v.fault_end ? v.fault_end + v.recovery.time : null, now: v.busy ? Date.now() / 1000 : null, height: 330 });
+  latencyChart(el, v.samples, { faultStart: v.fault_start, faultEnd: v.fault_end, recoveredAt: v.recoveredAt, now: v.busy ? Date.now() / 1000 : null, height: 330 });
 }
 
-// ---------------------------------------------------------------- experiments: plan
-const sourceLabel = (src) => (src.mode === "llm" ? `AI model ${src.provider}:${src.model}` : "deterministic rules (no LLM)");
-function rulesNotice(src, what) {
-  if (src.mode === "llm") return "";
-  return src.error ? `${what} produced by deterministic rules because the LLM provider failed: ${src.error}`
-    : `${what} produced by deterministic rules, not by an AI model: no LLM provider is configured.`;
+// ---------------------------------------------------------------- campaign
+let campChecked = null, campRunCache = { key: null, run: null, inc: null, grade: null };
+const CLASS = { db_unavailable: "Database down (not answering)", db_slow: "Database network degraded", db_cpu_starved: "Database starved of CPU",
+  broker_unavailable: "Message broker down (not answering)", broker_slow: "Message broker network degraded", broker_cpu_starved: "Message broker starved of CPU",
+  db_refusing_connections: "Database refusing connections", broker_refusing_connections: "Message broker refusing connections",
+  db_memory_exhausted: "Database out of memory", broker_memory_exhausted: "Message broker out of memory", webserver_disk_full: "Upload disk full", unknown: "Unknown: cannot attribute" };
+const HSTATUS = {
+  learning: ["learning normal behaviour", "unknown"], watching: ["watching, all normal", "good"], detected: ["failure detected", "critical"],
+  diagnosing: ["diagnosing", "serious"], remediating: ["applying the fix", "serious"], verifying: ["verifying the fix", "warning"],
+  resolved: ["self-healed", "good"], escalated: ["escalated to a human", "critical"], no_incident: ["no failure detected", "unknown"], interrupted: ["interrupted", "critical"],
+};
+const CP_NODE = { scan: ["Scan", "live probes"], rank: ["Rank", "AI model"], select: ["Select", "AI + safety policy"], confirm: ["Confirm", "you"], execute: ["Inject & heal", "agent + tools"], report: ["Report", "findings"] };
+const CP_STATUS = { scanning: ["Scanning", "warning"], ranking: ["AI is ranking", "serious"], awaiting_confirmation: ["Waiting for your confirmation", "warning"], running: ["Injecting failures", "serious"], done: ["Campaign complete", "good"], cancelled: ["Cancelled", "unknown"], stopped: ["Stopped", "warning"], failed: ["Failed", "critical"] };
+const SEV_T = { high: "critical", medium: "warning", low: "good" };
+const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, none: 0 };
+const cpDone = (c) => !c || !!c.ended || ["done", "cancelled", "failed", "stopped"].includes(c.status);
+const citeBtn = (id) => `<span class="cite ${id.startsWith("N") ? "n" : ""}" data-cite="${esc(id)}" title="hover to highlight the measurement">${esc(id)}</span>`;
+const whoDiag = (src) => (src.mode === "llm" ? `AI model (${src.model})` : src.mode === "rules-fallback" ? "rules (AI unavailable)" : "rules");
+document.addEventListener("mouseover", (e) => { const c = e.target.closest(".cite"); if (c) $$(`[data-sig="${c.dataset.cite}"]`).forEach((x) => x.classList.add("hl")); });
+document.addEventListener("mouseout", (e) => { if (e.target.closest(".cite")) $$(".hl").forEach((x) => x.classList.remove("hl")); });
+
+function cpHero(c) {
+  if (!c) return [["Ready", "good"], "Scan the live application for weak points. The AI ranks them and proposes experiments that test every one; nothing is injected until you confirm."];
+  const st = CP_STATUS[c.status] || [c.status, "unknown"];
+  const items = (c.selection || {}).items || [];
+  const cur = items.find((x) => x.status === "running");
+  const last = (c.scan.steps || []).slice(-1)[0];
+  const r = c.report;
+  return [st, {
+    scanning: last ? `${last.title}: ${last.detail}` : "Starting the scan…",
+    ranking: `The AI is ranking ${c.scan.findings.length} weak points and choosing experiments that test them.`,
+    awaiting_confirmation: `The AI proposed ${items.length} experiments. Review them below and approve at least ${(c.selection || {}).min || 3} to start injecting.`,
+    running: cur ? `Injecting ${cur.id}: ${faultTitle(cur)}. The self-healing agent is watching without being told what was injected.` : "Preparing the next experiment…",
+    done: r ? `${r.experiments} experiments run; ${r.self_healed} fixed by the self-healing agent with ${r.correct_diagnoses} correct diagnoses; ${r.findings.filter((f) => f.confirmed).length} of ${r.findings.length} tested weak points confirmed.` : "",
+    cancelled: "Cancelled before anything was injected.", stopped: "Stopped by the operator after the running experiment finished safely.",
+    failed: c.error || "The campaign failed; the engine's safety controls still removed any active fault.",
+  }[c.status] || ""];
 }
-async function loadPlan() {
-  let d;
-  try { d = await api("/api/plan"); } catch (e) { $("#pl-source").textContent = "unavailable: " + e.message; return; }
-  planData = d.plan; sequenceRunning = d.sequence_running;
-  const p = d.plan, ex = p && p.execution, blocked = safetyState && safetyState.blocked;
-  $("#pl-empty").hidden = !!p; $("#pl-recs").hidden = !p;
-  $("#pl-generate").disabled = sequenceRunning;
-  if (!p) { $("#pl-source").textContent = ""; $("#pl-notice").hidden = true; $("#pl-rejected").hidden = true; $("#pl-run").disabled = true; $("#pl-seq").textContent = ""; return; }
-  if (!planChecked || planChecked.id !== p.id) planChecked = { id: p.id, ranks: new Set(p.recommendations.filter((r) => r.status === "planned").map((r) => r.rank)) };
-  $("#pl-source").textContent = `Ranked by ${sourceLabel(p.source)} at ${fmtTime(p.created)}, from the dependency map and ${p.context.previous_experiments} earlier experiments.`;
-  const notice = rulesNotice(p.source, "This plan was");
-  $("#pl-notice").hidden = !notice; $("#pl-notice").textContent = notice;
-  const byRun = Object.fromEntries(((findingsData || {}).findings || []).map((f) => [f.run_id, f]));
-  const approved = new Set(ex && ex.status === "running" ? ex.selected : []);
-  const html = p.recommendations.map((r) => {
-    const f = r.run_id && byRun[r.run_id];
-    const status = r.status === "planned" ? (approved.has(r.rank) ? ["Approved, waiting", "warning"] : ["Recommended", "unknown"])
-      : r.status === "running" ? ["Running now", "serious"] : r.status === "executed" ? ["Completed", "good"]
-      : r.status === "rejected" ? ["Rejected by safety checks", "critical"] : ["Skipped", "warning"];
-    const result = f ? `${chip(SCOPE[f.deterministic.impact][0], SCOPE[f.deterministic.impact][1])}${sevChip(f.severity)}<span class="small muted">${f.deterministic.recovery_verified ? "recovered" + (f.deterministic.recovery_time_s != null ? " in " + f.deterministic.recovery_time_s.toFixed(1) + " s" : "") : "recovery NOT verified"}</span>`
-      : r.status === "executed" ? `<span class="muted small">not analysed yet</span>` : "";
-    const selectable = r.status === "planned" && !sequenceRunning;
-    const affects = r.workflows.map((w) => WORKFLOWS[w] || w);
-    return `<div class="plan-row ${r.status === "running" ? "now" : ""}">
-      <input type="checkbox" data-rank="${r.rank}" ${planChecked.ranks.has(r.rank) && selectable ? "checked" : ""} ${selectable ? "" : "disabled"} aria-label="select experiment ${r.rank}">
-      <div class="rank">${r.rank}</div>
-      <div class="what"><div class="t">${esc(faultTitle(r))} <span class="muted">for ${r.duration_s} s</span></div>
-        ${affects.length ? `<div class="small">Expected to affect: ${esc(affects.join(", "))}</div>` : ""}
-        <div class="small muted why">Why: ${esc(humanize(r.rationale))}</div>
-        <details class="small"><summary class="muted">hypothesis and safety limits</summary>${esc(humanize(r.hypothesis))}<br>Stops automatically at ${fmtPct(r.abort_max_error_rate)} errors or ${fmtMs(r.abort_max_p95_latency_ms)} response time.${r.risks.length ? "<br>Risks: " + esc(r.risks.join("; ")) : ""}</details></div>
-      <div class="state">${chip(...status)}<div class="result">${result}</div></div></div>`;
+function cpKpis(c) {
+  const items = c && c.selection ? c.selection.items : [];
+  const done = items.filter((x) => x.result);
+  const healed = done.filter((x) => x.result.agent.remediated_by === "agent").length;
+  const confirmed = c && c.scan ? c.scan.findings.filter((f) => findingVerdict(c, f).confirmed).length : 0;
+  const k = (label, v) => `<div class="kpi"><div class="k">${label}</div><div class="v">${v}</div></div>`;
+  $("#cp-kpis").innerHTML = k("Weak points", c && c.scan ? c.scan.findings.length : "–") + k("Approved", c && c.approved ? c.approved.length : "–")
+    + k("Self-healed", done.length ? `${healed} / ${done.length}` : "–") + k("Confirmed", c && c.scan && done.length ? `${confirmed} / ${c.scan.findings.length}` : "–");
+}
+function cpFlow(c) {
+  $("#cp-flow").innerHTML = Object.keys(CP_NODE).map((n) => {
+    const tr = c ? c.trace.filter((x) => x.node === n) : [];
+    let cls = tr.length ? "done" : "todo";
+    if (c && !cpDone(c) && (c.node === n || (n === "confirm" && c.status === "awaiting_confirmation"))) cls = "now";
+    if (c && c.status === "awaiting_confirmation" && n === "select") cls = "done";
+    let d = tr.length ? tr[tr.length - 1].text : "";
+    if (n === "confirm" && c && c.status === "awaiting_confirmation") d = "approve at least 3 below";
+    return `<li class="${cls}"><div class="t">${esc(CP_NODE[n][0])}</div><div class="who">${esc(CP_NODE[n][1])}</div><div class="d">${esc(d.length > 140 ? d.slice(0, 137) + "…" : d)}</div></li>`;
   }).join("");
-  const box = $("#pl-recs");
-  if (box.dataset.html !== html) { box.dataset.html = html; box.innerHTML = html || `<div class="empty">The plan has no valid recommendations.</div>`; }
-  const rej = p.rejected || [];
-  $("#pl-rejected").hidden = !rej.length;
-  $("#pl-rejected").innerHTML = rej.map((r) => `<div>Dropped by safety validation: <b>${esc(r.name)}</b>: ${esc(r.errors.join("; "))}</div>`).join("");
-  const n = [...planChecked.ranks].filter((k) => p.recommendations.find((r) => r.rank === k && r.status === "planned")).length;
-  $("#pl-run").disabled = sequenceRunning || !!blocked || !n;
-  $("#pl-run").textContent = sequenceRunning ? "Experiments running…" : n ? `Approve & run ${n} experiment${n > 1 ? "s" : ""}` : "Nothing selected";
-  $("#pl-seq").textContent = blocked ? "Experiments are blocked: verify the environment first."
-    : sequenceRunning ? `Running experiment ${ex.current ?? "…"} (approved: ${ex.selected.join(", ")}). One at a time, each checked by the safety controller first.`
-    : ex ? `Last sequence ${ex.status}${ex.stop_reason ? ": " + ex.stop_reason : ""}.`
-    : "Nothing runs until you approve it. Experiments run one at a time, each checked by the safety controller first.";
+}
+function cpScan(c) {
+  const steps = c ? c.scan.steps || [] : [];
+  $("#cp-scan").innerHTML = steps.length ? steps.map((s) => `<li><span class="ic ${s.status}">${s.status === "done" ? "✓" : s.status === "failed" ? "✕" : "…"}</span><div><b>${esc(s.title)}</b><div class="d">${esc(s.detail)}</div></div></li>`).join("")
+    : `<li class="muted">${c ? "Starting…" : "Start a scan to probe the live application."}</li>`;
+}
+function cpFindings(c) {
+  const box = $("#cp-findings");
+  if (!c || !c.scan.findings.length) { box.innerHTML = `<div class="empty">${c && c.status === "scanning" ? "Scanning…" : "The ranked findings appear after the scan."}</div>`; box.dataset.html = ""; $("#cp-rank-src").innerHTML = ""; return; }
+  const byId = Object.fromEntries(c.scan.findings.map((f) => [f.id, f]));
+  const order = c.ranking ? c.ranking.order : c.scan.findings.map((f, i) => ({ finding_id: f.id, rank: i + 1, rationale: "" }));
+  const src = c.ranking && c.ranking.source;
+  $("#cp-rank-src").innerHTML = !src ? `<span class="tag">ranking…</span>` : src.mode === "llm" ? `<span class="tag ai">ranked by AI: ${esc(src.model)}</span>` : `<span class="tag">ranked by rules${src.error ? " (AI unavailable)" : ""}</span>`;
+  const html = order.map((o) => { const f = byId[o.finding_id]; return `<div class="finding"><div class="rank">${o.rank}</div><div>
+      <div class="t">${esc(f.title)} ${chip(cap(f.severity), SEV_T[f.severity])} <span class="small muted">${esc(f.id)}</span></div>
+      ${o.rationale ? `<div class="small">${esc(humanize(o.rationale))}</div>` : ""}
+      <details class="small"><summary class="muted">evidence and possible tests</summary><ul>${f.evidence.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>
+      <div class="muted">Testable by: ${esc(f.tests.map((t) => faultTitle(t)).join(" · "))}</div></details></div></div>`; }).join("");
+  if (box.dataset.html !== html) { box.dataset.html = html; box.innerHTML = html; }
+}
+function cpSelection(c) {
+  const box = $("#cp-select"), sel = c && c.selection;
+  const awaiting = c && c.status === "awaiting_confirmation";
+  $("#cp-confirm").hidden = !awaiting;
+  if (!sel) { box.innerHTML = `<div class="empty">The AI proposes experiments after ranking. Nothing is injected until you confirm.</div>`; box.dataset.html = ""; $("#cp-sel-src").innerHTML = ""; $("#cp-sel-note").textContent = ""; $("#cp-confirm-note").textContent = ""; return; }
+  if (!campChecked || campChecked.id !== c.id) campChecked = { id: c.id, ids: new Set(sel.items.map((x) => x.id)) };
+  const src = c.ranking.source;
+  $("#cp-sel-src").innerHTML = src.mode === "llm" ? `<span class="tag ai">selected by AI: ${esc(src.model)}</span>` : `<span class="tag">selected by rules</span>`;
+  const covered = new Set(sel.items.flatMap((x) => x.finding_ids || [x.finding_id]));
+  $("#cp-sel-note").textContent = `${sel.items.length} experiments cover ${covered.size} of ${c.scan.findings.length} weak points · one at a time · each fault held up to ${sel.items[0] ? sel.items[0].duration_s : "–"} s or until the self-healing agent fixes it`;
+  const ST = { proposed: ["Proposed", "unknown"], approved: ["Queued", "warning"], declined: ["Not approved", "unknown"], running: ["Running now", "serious"], done: ["Done", "good"], failed: ["Refused / failed", "critical"], skipped: ["Skipped", "warning"] };
+  const fTitle = Object.fromEntries(c.scan.findings.map((f) => [f.id, f.title]));
+  let clock = Date.now() / 1000;
+  const running = sel.items.find((x) => x.status === "running");
+  if (running && running.started) clock = Math.max(clock, running.started + (running.est_s || 135));
+  const when = (x) => {
+    if (x.status === "done" || x.status === "failed") return `${hm(x.started)} → ${hm(x.ended)}` + (x.result && x.result.fault_start ? `<div class="muted">fault ${hm(x.result.fault_start)} → ${hm(x.result.fault_end)}</div>` : "");
+    if (x.status === "running") return `started ${hm(x.started)}<div class="muted">running now</div>`;
+    if (x.status === "approved") { const t = clock; clock += x.est_s || 135; return `≈ ${hm(t)}<div class="muted">up to ${Math.round((x.est_s || 135) / 6) / 10} min</div>`; }
+    if (x.status === "proposed") return `<span class="muted">after you confirm · up to ${Math.round((x.est_s || 135) / 6) / 10} min</span>`;
+    return "–";
+  };
+  const html = `<div class="tblwrap"><table class="tbl exps"><thead><tr>${awaiting ? "<th></th>" : ""}<th>#</th><th>What is injected</th><th>Weak points it tests</th><th>When</th><th>Status</th></tr></thead><tbody>`
+    + sel.items.map((x) => {
+      const tc = x.tool_call, res = x.result, ids = x.finding_ids || [x.finding_id];
+      const toolNote = tc ? `<div class="small muted">injected by ${tc.source.mode === "llm" ? "the AI agent" : "rules"} via inject_fault</div>` : "";
+      return `<tr class="${x.status === "running" ? "now" : ""}">
+        ${awaiting ? `<td><input type="checkbox" data-exp="${esc(x.id)}" ${campChecked.ids.has(x.id) ? "checked" : ""} aria-label="approve ${esc(x.id)}"></td>` : ""}
+        <td><b>${esc(x.id)}</b></td>
+        <td><b>${esc(faultTitle(x))}</b><details class="small"><summary class="muted">why and what we expect</summary>${esc(humanize(x.why))}<br><span class="muted">Expected: ${esc(humanize(x.expected_effect))}</span></details></td>
+        <td class="small">${ids.map((i) => `<div><b>${esc(i)}</b> ${esc(fTitle[i] || "")}</div>`).join("")}</td>
+        <td class="small nowrap">${when(x)}</td>
+        <td class="small">${chip(...(ST[x.status] || [x.status, "unknown"]))}${toolNote}</td></tr>`;
+    }).join("") + `</tbody></table></div>` + ((c.proposals && c.proposals.rejected.length) ? `<div class="banner warning">${c.proposals.rejected.map((r) => `Dropped by the safety policy: ${esc(faultTitle(r))}: ${esc(r.errors.join("; "))}`).join("<br>")}</div>` : "");
+  if (box.dataset.html !== html) { box.dataset.html = html; box.innerHTML = html; }
+  const n = [...campChecked.ids].length, min = sel.min || 3;
+  $("#cp-confirm").disabled = n < min;
+  $("#cp-confirm").textContent = n < min ? `Select at least ${min}` : `Approve ${n} & inject`;
+  $("#cp-confirm-note").textContent = awaiting ? `Uncheck any you do not want. At least ${min} are required. They run one at a time; the kill switch stops everything.` : c.approved ? `You approved ${c.approved.join(", ")}.` : "";
 }
 document.addEventListener("change", (e) => {
-  const c = e.target.closest("#pl-recs input[data-rank]"); if (!c || !planChecked) return;
-  c.checked ? planChecked.ranks.add(+c.dataset.rank) : planChecked.ranks.delete(+c.dataset.rank);
-  loadPlan();
+  const cb = e.target.closest("#cp-select input[data-exp]"); if (!cb || !campChecked) return;
+  cb.checked ? campChecked.ids.add(cb.dataset.exp) : campChecked.ids.delete(cb.dataset.exp);
+  $("#cp-select").dataset.html = ""; loadCampaign();
 });
-$("#pl-generate").addEventListener("click", async () => {
-  const b = $("#pl-generate"); b.disabled = true; b.textContent = "Planning…";
-  try { const p = await api("/api/plan", { method: "POST" }); planChecked = null; toast(`Plan ready: ${p.recommendations.length} experiments, ranked by ${sourceLabel(p.source)}`); }
-  catch (e) { toast("Planning failed: " + e.message); }
-  finally { b.textContent = "Generate new plan"; loadPlan(); }
+
+// ---- section 4: the running (or last) experiment, with the self-healing agent's full detail
+function renderMoments(inc, g) {
+  const m = (k, v, note) => `<div><div class="k">${k}</div><div class="v">${v}</div><div class="small muted">${note}</div></div>`;
+  const att = inc && inc.attempts[inc.attempts.length - 1];
+  $("#cp-moments").innerHTML = !inc ? "" :
+    m("Fault injected", g.injected && g.injected.fault_start ? "0 s" : "–", g.injected ? hm(g.injected.fault_start) : "")
+    + m("Detected", secs(g.time_to_detect_s), "statistics")
+    + m("Diagnosed", secs(g.time_to_diagnose_s), att ? (att.source.mode === "llm" ? "AI" : "rules") : "")
+    + m("Fix applied", secs(g.time_to_fix_s), att && att.runbook ? `runbook ${att.runbook.id}` : "")
+    + m("Back to normal", secs(g.time_to_verified_s), inc.status === "resolved" ? "verified" : "");
+}
+function renderSignals(inc) {
+  const att = inc && inc.attempts[inc.attempts.length - 1];
+  const snap = (att && att.snapshot) || (inc && inc.detection);
+  if (!snap) {
+    rows($("#hl-anoms tbody"), [], 5, inc && inc.live && inc.live.anomalies ? `Latest check: ${inc.live.signals.join(" · ")} (not yet confirmed)` : "No anomaly confirmed.");
+    $("#hl-normals").innerHTML = ""; $("#hl-detect-note").textContent = "An incident opens when anomalies persist on 2 consecutive checks.";
+    return;
+  }
+  $("#hl-detect-note").textContent = `Snapshot used for ${att ? "the diagnosis" : "detection"} at ${fmtTime(snap.ts)}: last ${snap.window_s} s (${snap.samples_in_window} requests) compared with the learned baseline. Hover a cited id to highlight it.`;
+  rows($("#hl-anoms tbody"), snap.anomalies.map((a) => `<tr data-sig="${esc(a.id)}"><td><span class="sigid">${esc(a.id)}</span></td><td>${esc(a.signal)}<div class="small muted">Rule: ${esc(a.rule)}</div></td><td class="nowrap">${esc(a.baseline)}</td><td class="nowrap"><b>${esc(a.observed)}</b></td><td class="nowrap">${esc(a.deviation)}</td></tr>`), 5, "none");
+  $("#hl-normals").innerHTML = snap.normals.map((n) => `<li data-sig="${esc(n.id)}"><span class="sigid">${esc(n.id)}</span> ${esc(n.signal)}</li>`).join("") || `<li class="muted">nothing is still normal</li>`;
+}
+function renderDiagnosis(inc) {
+  const atts = inc ? inc.attempts : [];
+  const att = atts[atts.length - 1];
+  if (!att) { $("#hl-diag").innerHTML = `<div class="empty">${inc && inc.status === "diagnosing" ? "Waiting for the diagnosis…" : "No failure diagnosed yet."}</div>`; $("#hl-diag-src").innerHTML = ""; $("#hl-runbook").innerHTML = `<div class="empty">No runbook selected yet.</div>`; return; }
+  const d = att.diagnosis, src = att.source;
+  $("#hl-diag-src").innerHTML = src.mode === "llm" ? `<span class="tag ai">AI: ${esc(src.model)}</span>` : `<span class="tag">${src.mode === "rules-fallback" ? "rules (AI failed)" : "rules"}</span>`;
+  const conf = { high: "good", medium: "warning", low: "critical" }[d.confidence];
+  const rc = att.rules_check;
+  const earlier = atts.slice(0, -1).map((a) => `<div class="attempt small">Attempt ${a.n}: “${esc(CLASS[a.diagnosis.failure_class])}” by ${esc(whoDiag(a.source))} → ${esc(a.runbook.id)} → ${a.verification ? (a.verification.ok ? "fixed" : "<b>not fixed</b>; this class was excluded and the agent diagnosed again") : "…"}</div>`).join("");
+  $("#hl-diag").innerHTML = `${atts.length > 1 ? `<div class="small muted">Attempt ${att.n} of ${atts.length}</div>` : ""}
+    <div class="diag-class">${esc(CLASS[d.failure_class])}</div>
+    <div class="row" style="align-items:center">${chip(cap(d.confidence) + " confidence", conf)} ${src.mode === "llm" ? chip(rc.agrees ? "Rules classifier agrees" : `Rules classifier says: ${CLASS[rc.failure_class]}`, rc.agrees ? "good" : "warning") : ""}</div>
+    <p class="mt">${esc(humanize(d.summary))}</p>
+    <h3 class="mt">How it reached this conclusion</h3>
+    <ol class="reason">${d.reasoning.map((s) => `<li>${esc(humanize(s.step))} ${s.cites.map(citeBtn).join("")}</li>`).join("")}</ol>
+    ${d.ruled_out.length ? `<h3>Ruled out</h3><ul class="plain">${d.ruled_out.map((r) => `<li><b>${esc(CLASS[r.failure_class])}</b>: ${esc(humanize(r.why))} ${r.cites.map(citeBtn).join("")}</li>`).join("")}</ul>` : ""}
+    ${src.error ? `<div class="note">${src.mode === "llm" ? "The model's first answer was rejected and corrected: " : "The AI model could not be used, so the rules classifier decided: "}${esc(src.error)}</div>` : ""}
+    ${earlier}`;
+  const rb = att.runbook;
+  if (!rb) { $("#hl-runbook").innerHTML = `<div class="empty">Selecting…</div>`; return; }
+  const ex = att.execution;
+  $("#hl-runbook").innerHTML = `<div class="small muted">Rule matched: “${esc(CLASS[rb.failure_class])}” → <b>${esc(rb.id)}</b></div>
+    <div class="diag-class small-class">${esc(rb.title)}</div><p class="small">${esc(rb.why)}</p>
+    ${ex ? `<ul class="steps">${ex.steps.map((s) => `<li>${chip(s.ok ? "ok" : "failed", s.ok ? "good" : "critical")} <b>${esc(s.step)}</b> <span class="muted">${esc(s.detail)}</span></li>`).join("")}</ul>` : `<div class="muted">running…</div>`}`;
+}
+function renderVerify(inc, g) {
+  if (!inc || !inc.attempts.length) { $("#hl-verify").innerHTML = `<div class="empty">${inc && inc.status === "no_incident" ? (g.correct_no_incident ? "No user-facing impact: the agent correctly raised no incident." : "No anomaly was confirmed.") : "Nothing to verify yet."}</div>`; return; }
+  const att = inc.attempts[inc.attempts.length - 1], v = att.verification;
+  const checks = v ? `<ul class="steps">${v.checks.map((c) => `<li>${chip(c.ok ? "passed" : "failed", c.ok ? "good" : "critical")} <b>${esc(c.check)}</b> <span class="muted">${esc(c.detail)}</span></li>`).join("")}</ul>`
+    : `<div class="muted">${inc.status === "verifying" ? "checking…" : "waiting for the fix"}</div>`;
+  const by = g.remediated_by;
+  const removed = !by ? "" : `<p>${chip(by === "agent" ? "Confirmed by the engine: removed by the agent" : `Removed by the ${by}`, by === "agent" ? "good" : "warning")}</p>`;
+  const closed = !!inc.ended && g.injected && g.injected.target;
+  const grade = !closed ? `<p class="small muted">The injected fault is hidden from the agent and graded when the incident closes.</p>`
+    : `<p class="small">Actually injected: <b>${esc(faultTitle(g.injected))}</b> · agent's answer ${esc(CLASS[g.final_class] || "–")} ${g.correct == null ? "" : chip(g.correct ? "correct" : "wrong", g.correct ? "good" : "critical")}</p>`;
+  $("#hl-verify").innerHTML = checks + removed + grade;
+}
+async function cpLive(c) {
+  const items = c && c.selection ? c.selection.items : [];
+  const cur = items.find((x) => x.status === "running") || [...items].reverse().find((x) => x.status === "done");
+  const el = $("#cp-chart");
+  $("#cp-agent").hidden = !cur;
+  if (!cur || !cur.run_id) {
+    el.innerHTML = `<div class="empty">The live view appears when an experiment runs.</div>`; el.dataset.sig = ""; $("#cp-wf").innerHTML = ""; $("#cp-live-status").innerHTML = ""; $("#cp-moments").innerHTML = "";
+    $("#cp-live-title").textContent = "4 · How the website reacts"; renderSignals(null); renderDiagnosis(null); renderVerify(null, {}); return;
+  }
+  const live = cur.status === "running";
+  const key = cur.run_id + "|" + (live ? Math.floor(Date.now() / 2000) : "done");
+  if (campRunCache.key !== key) {
+    try {
+      const [run, inc] = await Promise.all([api("/api/runs/" + encodeURIComponent(cur.run_id)), api(`/api/incidents/inc-${encodeURIComponent(cur.run_id)}`).catch(() => null)]);
+      campRunCache = { key, run, inc: inc && inc.incident, grade: (inc && inc.grade) || {} };
+    } catch { return; }
+  }
+  const r = campRunCache.run, inc = campRunCache.inc, g = campRunCache.grade;
+  $("#cp-live-title").textContent = `4 · How the website reacts: ${cur.id} ${faultTitle(cur)}${live ? " (live)" : " (last run)"}`;
+  const hs = inc ? HSTATUS[inc.status] || [inc.status, "unknown"] : ["starting", "unknown"];
+  $("#cp-live-status").innerHTML = chip(`Self-healing agent: ${hs[0]}`, hs[1]);
+  const att = inc && inc.attempts[inc.attempts.length - 1];
+  const marks = inc ? [[inc.detected_at, "detected"], [att && att.remediated_at, "fix applied"], [inc.resolved_at, "verified"]].filter((m) => m[0]).map(([t, label]) => ({ t, label })) : [];
+  const sig = [r.id, r.samples.length, r.fault_end, marks.length].join("|");
+  if (el.dataset.sig !== sig) {
+    el.dataset.sig = sig;
+    latencyChart(el, r.samples, { faultStart: r.fault_start, faultEnd: r.fault_end, marks, now: live ? Date.now() / 1000 : null, height: 300 });
+  }
+  renderWorkflows($("#cp-wf"), r.samples);
+  renderMoments(inc, g); renderSignals(inc); renderDiagnosis(inc); renderVerify(inc, g);
+}
+
+// ---- section 5: findings, one row per weak point
+function findingVerdict(c, f) {
+  const items = ((c.selection || {}).items || []).filter((x) => (x.finding_ids || [x.finding_id]).includes(f.id) && x.status !== "declined");
+  const done = items.filter((x) => x.result);
+  const hit = done.filter((x) => ["full", "partial"].includes(x.result.analyst.impact));
+  const worst = [...done].sort((a, b) => (SEV_RANK[b.result.analyst.severity] || 0) - (SEV_RANK[a.result.analyst.severity] || 0))[0];
+  return { items, done, hit, worst, confirmed: hit.length > 0, pending: items.length && done.length < items.length };
+}
+function cpFindingsTable(c) {
+  const tbody = $("#cp-ftable tbody");
+  if (!c || !c.scan.findings.length || !c.selection) { rows(tbody, [], 6, "Findings appear here as experiments finish."); return; }
+  const list = c.scan.findings.map((f) => ({ f, v: findingVerdict(c, f) }))
+    .sort((a, b) => (b.v.done.length ? 1 : 0) - (a.v.done.length ? 1 : 0) || (SEV_RANK[(b.v.worst || { result: { analyst: {} } }).result.analyst.severity] || 0) - (SEV_RANK[(a.v.worst || { result: { analyst: {} } }).result.analyst.severity] || 0));
+  const html = list.map(({ f, v }) => {
+    const tested = v.items.map((x) => `${x.id} ${faultTitle(x).toLowerCase()}`).join(", ") || "not tested";
+    if (!v.done.length) {
+      const st = !v.items.length ? ["Not tested", "unknown"] : v.items.some((x) => x.status === "running") ? ["Running now", "serious"] : ["Queued", "unknown"];
+      return `<tr class="sev-pending"><td><b>${esc(f.title)}</b></td><td class="small">${esc(tested)}</td><td>${chip(...st)}</td><td class="small muted">–</td><td class="small muted">–</td><td class="small muted">–</td></tr>`;
+    }
+    const w = v.worst.result, an = w.analyst, ag = w.agent, ph = w.phases, sev = an.severity || "none";
+    const verdictChip = v.confirmed ? chip(`Confirmed · ${cap(sev)}`, SEV_TONE[sev]) : chip("Not confirmed", "good");
+    const err = (p) => (p && p.n ? fmtPct(p.error_rate) : "–");
+    const broke = [...(an.failed || []), ...(an.degraded || [])].map((x) => WORKFLOWS[x] || x);
+    let what = `Errors ${err(ph.before)} → <b>${err(ph.during)}</b> → ${err(ph.after)}.` + (broke.length ? ` Affected: ${esc(broke.join(", "))}.` : " No workflow was affected.");
+    if (f.category === "circuit_breaker" && w.circuit_breaker) what += ` ${esc(cap(w.circuit_breaker.verdict))}.`;
+    const heal = ag.remediated_by === "agent" ? `${chip(ag.time_to_verified_s != null ? `fixed in ${secs(ag.time_to_verified_s)}` : "fault removed by the agent", "good")}<br><span class="muted">${ag.status === "resolved" ? (ag.correct ? "correct diagnosis" : "diagnosis was wrong") : "agent did not confirm its own fix"}</span>`
+      : ag.correct_no_incident ? `${chip("nothing to fix", "good")}<br><span class="muted">correctly stayed quiet</span>`
+      : ag.final_class ? `${chip("diagnosed, fixed late", "warning")}<br><span class="muted">${ag.correct ? "correct diagnosis" : "wrong diagnosis"}; removed by the ${esc(ag.remediated_by || "engine")}</span>`
+      : `${chip(HSTATUS[ag.status] ? cap(HSTATUS[ag.status][0]) : "–", "warning")}`;
+    const cls = !v.confirmed ? "sev-low" : SEV_RANK[sev] >= 4 ? "sev-crit" : SEV_RANK[sev] === 3 ? "sev-high" : "sev-low";
+    return `<tr class="${cls}"><td><b>${esc(f.title)}</b></td><td class="small">${esc(tested)}</td><td>${verdictChip}</td><td class="small">${what}</td><td class="small">${heal}</td><td class="small">${an.fix ? esc(humanize(an.fix)) : "–"}</td></tr>`;
+  });
+  rows(tbody, html, 6, "");
+}
+async function loadCampaign() {
+  let d; try { d = await api("/api/campaign/latest"); } catch (e) { $("#cp-text").textContent = "Unavailable: " + e.message; return; }
+  const c = d.campaign;
+  const [st, text] = cpHero(c);
+  $("#cp-status").innerHTML = chip(st[0], st[1]); $("#cp-text").textContent = text;
+  $("#cp-start").disabled = !cpDone(c);
+  $("#cp-start").textContent = c && cpDone(c) ? "Start a new scan" : "Start resilience scan";
+  $("#cp-cancel").hidden = cpDone(c);
+  $("#cp-cancel").textContent = c && c.status === "running" ? "Stop after this experiment" : "Cancel";
+  $("#cp-meta").textContent = c ? `${c.id} · started ${fmtTime(c.created)}` : "";
+  cpKpis(c); cpFlow(c); cpScan(c); cpFindings(c); cpSelection(c); cpFindingsTable(c); cpLive(c);
+}
+$("#cp-start").addEventListener("click", async () => {
+  try { await api("/api/campaign", { method: "POST" }); campChecked = null; toast("Resilience scan started"); }
+  catch (e) { toast("Not started: " + e.message, 9000); }
+  loadCampaign();
 });
-$("#pl-run").addEventListener("click", async () => {
-  if (!planData || !planChecked) return;
-  const ranks = [...planChecked.ranks].sort((a, b) => a - b);
-  try { await api(`/api/plan/${encodeURIComponent(planData.id)}/run`, { method: "POST", body: { ranks } }); toast("Approved and started: experiments " + ranks.join(", ")); }
+$("#cp-cancel").addEventListener("click", async () => {
+  const c = (await api("/api/campaign/latest").catch(() => ({}))).campaign; if (!c) return;
+  try { await api(`/api/campaign/${encodeURIComponent(c.id)}/cancel`, { method: "POST" }); toast(c.status === "running" ? "The campaign stops after the running experiment finishes safely." : "Campaign cancelled."); }
+  catch (e) { toast("Cancel failed: " + e.message); }
+  loadCampaign();
+});
+$("#cp-confirm").addEventListener("click", async () => {
+  const c = (await api("/api/campaign/latest").catch(() => ({}))).campaign; if (!c || !campChecked) return;
+  const approved = c.selection.items.map((x) => x.id).filter((id) => campChecked.ids.has(id));
+  try { await api(`/api/campaign/${encodeURIComponent(c.id)}/confirm`, { method: "POST", body: { approved } }); toast(`Approved ${approved.join(", ")}: injecting one at a time`); }
   catch (e) { toast("Not started: " + e.message, 10000); }
-  refreshAll();
+  loadCampaign();
 });
-
-// ---------------------------------------------------------------- experiments: run history
-async function loadRuns() {
-  let runs;
-  try { runs = await api("/api/runs?limit=40"); } catch (e) { $("#obs-empty").hidden = false; $("#obs-empty").textContent = "Cannot load runs: " + e.message; return; }
-  const sel = $("#obs-run");
-  $("#obs-empty").hidden = runs.length > 0;
-  const sig = runs.map((r) => r.id + r.state).join();
-  if (sel.dataset.sig === sig) return;
-  sel.dataset.sig = sig;
-  sel.innerHTML = runs.map((r) => `<option value="${esc(r.id)}">${fmtTime(r.created)} · ${r.kind === "experiment" ? esc(faultTitle(r.config)) : "baseline"} · ${esc(r.result || r.state)}</option>`).join("");
-  if (!runs.length) return;
-  if (!selectedRun || !runs.find((r) => r.id === selectedRun)) selectedRun = (runs.find((r) => r.kind === "experiment" && r.state !== "rejected") || runs[0]).id;
-  sel.value = selectedRun;
-  loadRun(selectedRun);
-}
-$("#obs-run").addEventListener("change", (e) => { selectedRun = e.target.value; loadRun(selectedRun); });
-async function loadRun(id) {
-  let r;
-  try { r = await api("/api/runs/" + encodeURIComponent(id)); } catch (e) { toast("Cannot load run: " + e.message); return; }
-  const o = r.outcome || {}, metrics = (r.summary || {}).metrics, rec = o.recovery || {}, rem = o.fault_removal || {}, isExp = r.kind === "experiment";
-  $("#obs-report").hidden = $("#obs-export").hidden = !isExp;
-  $("#obs-report").href = `/api/runs/${encodeURIComponent(id)}/report`; $("#obs-export").href = `/api/runs/${encodeURIComponent(id)}/export`;
-  latencyChart($("#obs-latency"), r.samples, { faultStart: r.fault_start, faultEnd: r.fault_end, recoveredAt: rec.recovery_time_s != null && r.fault_end ? r.fault_end + rec.recovery_time_s : null });
-  const prow = [];
-  for (const [phase, ph] of Object.entries(metrics || {})) for (const [p, s] of [["all user-facing", ph.critical], ...Object.entries(ph.probes)])
-    prow.push(`<tr><td>${esc(phase)}</td><td>${esc(p)}</td><td class="num">${s.n}</td><td class="num">${fmtPct(s.error_rate)}</td><td class="num">${fmtMs(s.p50_ms)}</td><td class="num">${fmtMs(s.p95_ms)}</td></tr>`);
-  rows($("#obs-phases tbody"), prow, 6, metrics ? "no samples" : "summary not available (run in progress or interrupted)");
-  const yn = (v) => (v == null ? chip("n/a", "unknown") : chip(v ? "yes" : "NO", v ? "good" : "critical"));
-  $("#obs-recovery").innerHTML = !isExp ? `<div class="muted">Baseline run: no fault injected.</div>` : `<table class="tbl"><tbody>
-    <tr><td>Result</td><td>${chip(o.result || r.state, toneOf(r.state))}</td><td class="small">${esc(o.abort_reason || "")}</td></tr>
-    <tr><td>Fault injected</td><td>${yn(o.injected ?? (r.fault_start ? true : null))}</td><td class="small">${fmtTime(r.fault_start)} → ${fmtTime(r.fault_end)}</td></tr>
-    <tr><td>Rollback verified</td><td>${yn(rem.verified)}</td><td class="small">${esc((rem.notes || []).join(" | "))}</td></tr>
-    <tr><td>Recovery verified</td><td>${yn(rec.verified)}</td><td class="small">${rec.recovery_time_s != null ? rec.recovery_time_s.toFixed(1) + " s after rollback" : esc(rec.notes || "")}</td></tr></tbody></table>`;
-  const logs = o.logs || {};
-  $("#obs-logs").innerHTML = Object.keys(logs).length ? Object.entries(logs).map(([s, l]) => `<div class="small"><b>${esc(s)}</b> <span class="muted">${l.relevant.length} relevant of ${l.total} lines</span></div><pre class="logs">${esc((l.relevant.length ? l.relevant : l.tail).join("\n")) || "(no log lines)"}</pre>`).join("") : `<div class="muted small">No logs captured for this run.</div>`;
-}
-
-// ---------------------------------------------------------------- experiments: manual
-async function loadCatalog() {
-  try { catalog = await api("/api/catalog"); } catch (e) { toast("Cannot load catalog: " + e.message); return; }
-  const f = $("#exp-form"), L = catalog.limits;
-  f.fault_type.innerHTML = Object.entries(catalog.faults).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join("");
-  $("#limits-desc").textContent = `Safety limits: duration ${L.min_duration_s}–${L.max_duration_s} s; latency ${L.min_latency_ms}–${L.max_latency_ms} ms; recovery ≤ ${L.max_recovery_timeout_s} s; a watchdog removes the fault ${L.watchdog_grace_s} s after the planned end. Approved targets: ${Object.keys(catalog.targets).join(", ")}.`;
-  syncTargets();
-}
-function syncTargets() {
-  const f = $("#exp-form"), ft = f.fault_type.value, cur = f.target.value;
-  f.target.innerHTML = Object.entries(catalog.targets).filter(([, fs]) => fs.includes(ft)).map(([k]) => `<option>${k}</option>`).join("");
-  if (cur) f.target.value = cur;
-  $$(".lat-only").forEach((x) => (x.hidden = ft !== "network_latency"));
-}
-$("#exp-form").fault_type.addEventListener("change", syncTargets);
-function readConfig() {
-  const f = $("#exp-form");
-  const cfg = {
-    name: f.name.value, hypothesis: f.hypothesis.value, fault_type: f.fault_type.value, target: f.target.value,
-    duration_s: +f.duration_s.value, recovery_timeout_s: +f.recovery_timeout_s.value,
-    thresholds: { max_error_rate: +f.max_error_rate.value / 100, max_p95_latency_ms: +f.max_p95_latency_ms.value, window_s: +f.window_s.value, min_samples: +f.min_samples.value },
-  };
-  if (cfg.fault_type === "network_latency") cfg.latency_ms = +f.latency_ms.value;
-  return cfg;
-}
-function renderChecks(checks, errors) {
-  $("#preflight").innerHTML = (checks || []).map((c) => `<li>${chip(c.ok ? "pass" : "FAIL", c.ok ? "good" : "critical")} ${esc(c.name)} <span class="muted">${esc(c.detail)}</span></li>`).join("");
-  const box = $("#exp-errors");
-  box.hidden = !(errors && errors.length);
-  box.innerHTML = (errors || []).map((e) => `<div>${esc(e)}</div>`).join("");
-}
-$("#btn-preflight").addEventListener("click", async () => {
-  $("#preflight").innerHTML = `<li class="muted">running…</li>`;
-  try { const r = await api("/api/experiments/preflight", { method: "POST", body: readConfig() }); renderChecks(r.checks, r.errors); }
-  catch (e) { renderChecks(e.data?.checks || [], [e.message]); }
-});
-$("#exp-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  try { const r = await api("/api/experiments", { method: "POST", body: readConfig() }); toast("Experiment started: " + r.run_id); renderChecks([], []); }
-  catch (err) { renderChecks(err.data?.checks || [], err.data?.errors || [err.message]); }
-  refreshAll();
-});
-$("#run-baseline").addEventListener("click", async () => {
-  try { const r = await api("/api/baseline", { method: "POST", body: { duration_s: +$("#base-dur").value } }); toast("Baseline started: " + r.run_id); }
-  catch (e) { toast("Baseline rejected: " + e.message); }
-  refreshAll();
-});
-
-// ---------------------------------------------------------------- findings
-const names = (a) => a.map((w) => WORKFLOWS[w] || w);
-function recoveryText(det) {
-  return det.recovery_verified ? `Recovered${det.recovery_time_s != null ? " in " + det.recovery_time_s.toFixed(1) + " s" : ""}` : det.injected ? "NOT verified" : "–";
-}
-function findingHtml(f, rank) {
-  const d = f.diagnosis, det = f.deterministic, facts = Object.fromEntries(det.facts.map((x) => [x.id, x.text]));
-  const ai = f.source.mode === "llm", tag = ai ? `<span class="tag ai">AI hypothesis</span>` : `<span class="tag">Rule-based hypothesis</span>`;
-  const rc = d.root_causes[0];
-  const li = (arr, tone, word) => arr.map((w) => `<li>${chip(word, tone)} ${esc(w)}</li>`).join("");
-  return `<div class="card fcard">
-    <div class="fhead">${rank ? `<div class="rank">${rank}</div>` : ""}<h2>${esc(faultTitle(det))}</h2>${sevChip(f.severity)}${chip(SCOPE[det.impact][0], SCOPE[det.impact][1])}
-      <span class="small muted">${f.status === "aborted" ? `fault stopped early by ${det.abort_kind === "threshold" ? "the safety threshold" : "the kill switch"}` : ""}</span></div>
-    <div class="fcols">
-      <div><h3>What broke <span class="tag">measured</span></h3>
-        <ul class="plain">${li(names(det.failed), "critical", "Failed")}${li(names(det.degraded), "warning", "Degraded")}${li(names(det.functional), "good", "Unaffected")}</ul>
-        <div class="small">${det.recovery_verified ? chip(recoveryText(det) + " after rollback", "good") : det.injected ? chip("Recovery NOT verified", "critical") : ""}</div></div>
-      <div><h3>Likely cause</h3>${rc ? `<p>${esc(humanize(rc.hypothesis))}</p><div class="small muted">${tag} ${esc(rc.confidence)} confidence</div>` : `<p><b>Inconclusive.</b> ${esc(d.summary)}</p>`}</div>
-      <div><h3>Recommended fix</h3><p>${esc(humanize(d.recommendation.action))}</p>
-        ${d.verification.success_criteria.length ? `<div class="small muted">Fixed when: ${esc(d.verification.success_criteria.join("; "))}</div>` : ""}</div>
-    </div>
-    <details class="small"><summary class="muted">Evidence (${det.facts.length} measured facts) and limitations</summary>
-      ${rc ? `<div><b>Supports the cause:</b></div><ul>${rc.supporting_evidence.map((i) => `<li class="fact"><b>${esc(i)}</b> ${esc(facts[i] || "?")}</li>`).join("")}</ul>` : ""}
-      ${rc && rc.contradicting_evidence.length ? `<div><b>Speaks against it:</b></div><ul>${rc.contradicting_evidence.map((i) => `<li class="fact"><b>${esc(i)}</b> ${esc(facts[i] || "?")}</li>`).join("")}</ul>` : ""}
-      ${d.root_causes.slice(1).map((r) => `<div>${tag} ${esc(r.hypothesis)} <span class="muted">(${esc(r.confidence)})</span></div>`).join("")}
-      <div><b>All measured facts:</b></div><ul>${det.facts.map((x) => `<li class="fact"><b>${esc(x.id)}</b> ${esc(x.text)}</li>`).join("")}</ul>
-      <ul>${[...new Set([...det.limitations, ...d.limitations])].map((x) => `<li class="muted">${esc(x)}</li>`).join("")}</ul>
-      ${f.retest ? `<div>Change since previous run <code>${esc(f.retest.previous_run)}</code>: severity ${f.retest.severity_delta ?? "n/a"}, resilience ${f.retest.resilience_delta ?? "n/a"}.</div>` : ""}
-      <code>${esc(f.run_id)}</code> · <a href="/api/runs/${encodeURIComponent(f.run_id)}/export" target="_blank">evidence JSON ↗</a> · <a href="/api/runs/${encodeURIComponent(f.run_id)}/report" target="_blank">run report ↗</a>
-    </details></div>`;
-}
-async function loadFindings() {
-  let d;
-  try { d = await api("/api/findings"); } catch (e) { $("#fd-note").textContent = "Findings unavailable: " + e.message; return; }
-  const changed = JSON.stringify(d) !== JSON.stringify(findingsData);
-  findingsData = d;
-  renderScore();
-  if (!changed && $("#fd-score").children.length) return;   // unchanged: keep open details as they are
-  const o = d.overall, pct = (v) => (v == null ? null : Math.round(v * 100));
-  const meter = (label, v, hint) => `<div class="meter"><div class="row between"><span>${label}</span><b>${v == null ? "n/a" : v + "%"}</b></div><div class="track"><div class="fill" style="width:${v ?? 0}%"></div></div><div class="small muted">${hint}</div></div>`;
-  $("#fd-score").innerHTML = `<h2>Resilience score</h2>
-    <div class="bigscore">${o.score == null ? `<span class="muted">n/a</span>` : `${Math.round(o.score)}<span class="of"> / 100</span>`}</div>
-    <div class="small">${o.scenarios_scored} of ${o.scenarios_total} failure scenarios tested · ${o.experiments_analysed} experiments${o.capped_unrecovered ? " · <b>capped at 25: a run did not recover</b>" : ""}</div>
-    ${meter("Stays available during a fault", pct(o.components.availability), "half of the score")}
-    ${meter("Stays fast during a fault", pct(o.components.performance), "20% of the score")}
-    ${meter("Recovers quickly afterwards", pct(o.components.recovery), "30% of the score")}
-    <div class="small muted">Computed from measurements only, never by the AI.</div>`;
-  const chosen = new Set(o.per_scenario.map((s) => s.run_id));
-  const main = d.findings.filter((f) => chosen.has(f.run_id) && f.severity.score != null), other = d.findings.filter((f) => !main.includes(f));
-  rows($("#fd-summary tbody"), main.map((f, i) => { const det = f.deterministic; return `<tr><td><b>${i + 1}</b></td><td><b>${esc(faultTitle(det))}</b></td><td>${sevChip(f.severity)}</td><td>${chip(SCOPE[det.impact][0], SCOPE[det.impact][1])} <span class="small muted">${det.failed.length} failed, ${det.degraded.length} degraded of ${det.workflows.filter((w) => w.status !== "no_data").length} workflows</span></td><td>${esc(recoveryText(det))}</td></tr>`; }), 5, "No scored experiment yet.");
-  $("#fd-note").textContent = (o.untested_scenarios.length ? "Not yet tested: " + o.untested_scenarios.map((s) => faultTitle({ fault_type: s[0], target: s[1] })).join(", ") + ". " : "") + "The score covers only these scenarios, not every possible failure.";
-  const rules = main.filter((f) => f.source.mode !== "llm"), err = rules.find((f) => f.source.error);
-  $("#fd-notice").hidden = !rules.length;
-  $("#fd-notice").textContent = rules.length ? `The likely causes and fixes below (${rules.length} of ${main.length}) come from deterministic rules, not an AI model` + (err ? `: the LLM provider failed (${err.source.error})` : ": no LLM provider is configured") + ". What broke, the severity and the score are measured and do not depend on the AI." : "";
-  $("#fd-empty").hidden = d.findings.length > 0;
-  $("#fd-list").innerHTML = main.map((f, i) => findingHtml(f, i + 1)).join("");
-  $("#fd-other-wrap").hidden = !other.length;
-  $("#fd-other").innerHTML = other.map((f) => findingHtml(f, 0)).join("");
-  $("#fd-method").textContent = d.methodology;
-}
-$("#fd-analyze-all").addEventListener("click", async (ev) => {
-  ev.target.disabled = true;
-  try { const r = await api("/api/analyze-all", { method: "POST" }); toast(r.analysed.length ? `Analysed ${r.analysed.length} run(s)` : "Nothing new to analyse"); }
-  catch (e) { toast("Analysis failed: " + e.message); }
-  ev.target.disabled = false; loadFindings();
-});
-async function loadAi() {
-  try {
-    const a = await api("/api/ai/status");
-    $("#ai-pill").innerHTML = a.provider ? chip(`AI: ${a.provider}:${a.model}`, "good") : chip("No AI model · using rules", "warning");
-    $("#ai-pill").title = a.provider ? "Plans and diagnoses are requested from this model, then validated" : "No LLM provider is configured. Plans and diagnoses come from deterministic rules and are labelled as such.";
-  } catch { /* the connection pill already shows the problem */ }
-}
 
 // ---------------------------------------------------------------- refresh loop
-async function tick() {
-  let v;
-  try { v = await getView(); } catch { return; }
+async function tickOverview() {
+  if (currentTab !== "overview") return;
+  let v; try { v = await getView(); } catch { return; }
   lastView = v;
-  if (currentTab === "overview") {
-    renderHero(v);
-    renderStory($("#story-ov"), story(v));
-    renderWorkflows($("#wf-ov"), v);
-    renderChart(v);
-    renderLog(v);
-  }
-  if (currentTab === "experiments") {
-    const st = statusOf(v);
-    $("#now-title").textContent = !v || v.source === "other" ? "No experiment yet" : `${v.busy ? "Running now" : "Latest experiment"}: ${faultTitle(v.config)}`;
-    $("#now-status").innerHTML = chip(st.label, st.tone);
-    renderStory($("#story-ex"), story(v));
-  }
+  renderHealth(v); renderOverviewRun(v); renderLog(v);
 }
 async function refreshAll() {
   await loadOverview().catch(() => {});
-  await tick();
-  await loadFindings();
-  if (currentTab === "overview") { loadGraph(); tick(); }
-  if (currentTab === "experiments") { loadPlan(); loadRuns(); }
+  if (currentTab === "overview") { await tickOverview(); loadGraph(); loadMetrics(); loadScore(); }
+  if (currentTab === "campaign") loadCampaign();
 }
 (async function init() {
-  legend($("#lg-ov"));
-  await loadCatalog();
+  legend($("#lg-ov")); legend($("#lg-cp"), true);
   loadAi();
   const wanted = location.hash.slice(1);
-  if (["experiments", "findings"].includes(wanted)) showTab(wanted); else await refreshAll();
-  setInterval(tick, 1000);
+  if (wanted === "campaign") showTab("campaign"); else await refreshAll();
+  setInterval(tickOverview, 2000);
+  setInterval(() => { if (currentTab === "campaign") loadCampaign(); }, 1500);
   setInterval(() => loadOverview().catch(() => {}), 3000);
-  setInterval(() => { if (currentTab === "overview") loadGraph(); if (currentTab === "experiments") { loadPlan(); loadRuns(); } }, 3000);
-  setInterval(loadFindings, 5000);
+  setInterval(() => { if (currentTab === "overview") { loadGraph(); loadMetrics(); } }, 5000);
+  setInterval(() => { if (currentTab === "overview") loadScore(); }, 15000);
   setInterval(loadAi, 30000);
 })();

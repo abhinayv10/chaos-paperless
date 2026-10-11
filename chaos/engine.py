@@ -64,6 +64,11 @@ class Engine:
         self._thread: Optional[threading.Thread] = None
         self._live: dict = {}
         self._live_lock = threading.Lock()
+        # self-healing mode: called with only the run id when an agent-mode
+        # experiment starts; the agent reports its fix via agent_remediated()
+        self.on_start: Optional[Callable[[str], None]] = None
+        self._agent_fix = threading.Event()
+        self._agent_note = ""
 
     # ------------------------------------------------------------------ live state
     def _set_live(self, **kw) -> None:
@@ -134,6 +139,7 @@ class Engine:
             spec = {
                 "fault_type": cfg.fault_type, "service": cfg.target, "container_id": target.id,
                 "run_id": "preflight", "duration_s": cfg.duration_s, "latency_ms": cfg.latency_ms,
+                "loss_pct": cfg.loss_pct, "cpu_limit": cfg.cpu_limit, "memory_mb": cfg.memory_mb,
             }
             checks += build_fault(self.docker, spec).preflight()
         except NotInSandbox as e:
@@ -168,13 +174,30 @@ class Engine:
                               "phase": "preflight", "breaches": [], "message": "preflight passed",
                               "preflight": [c.to_dict() for c in checks], "started": time.time()}
             self._set_live(state=RunState.PREFLIGHT.value)
+            self._agent_fix.clear()
+            self._agent_note = ""
             self._thread = threading.Thread(target=self._execute, args=(run_id, cfg, spec, checks),
                                             name=f"experiment-{run_id}", daemon=True)
             self._thread.start()
         except Exception:
             self.safety.release()
             raise
+        if cfg.remediation == "agent" and self.on_start:
+            try:
+                self.on_start(run_id)
+            except Exception as e:  # noqa: BLE001 - no agent just means the engine's deadline applies
+                self.store.event("agent_error", f"could not attach agent: {type(e).__name__}: {e}", run_id, "error")
         return run_id
+
+    def agent_remediated(self, run_id: str, note: str) -> dict:
+        """The self-healing agent ran a runbook. The engine checks the real
+        fault state on its next tick; a wrong fix leaves the fault in place."""
+        live = self.live()
+        if live.get("run_id") != run_id or live.get("state") not in (RunState.ACTIVE.value, RunState.INJECTING.value):
+            return {"accepted": False, "reason": f"run is not in its fault window (state {live.get('state')})"}
+        self._agent_note = note
+        self._agent_fix.set()
+        return {"accepted": True}
 
     def wait(self, timeout: float | None = None) -> None:
         if self._thread:
@@ -202,6 +225,9 @@ class Engine:
         removal_ok = recovery_ok = None
         recovery_time = None
         wl_stopped = False
+        agent_mode = cfg.remediation == "agent"
+        remediated_by: Optional[str] = None
+        observed_breaches: list[dict] = []
         try:
             # ---- 3. baseline immediately before injection
             self._set_live(state=RunState.BASELINE.value, phase="baseline",
@@ -222,28 +248,54 @@ class Engine:
             self._set_live(state=RunState.INJECTING.value, message=f"injecting {cfg.fault_type} on {cfg.target}")
             self.safety.mark_active({**spec, "planned_end": time.time() + cfg.duration_s})
             try:
+                # the fault starts when the injection starts: a docker stop takes
+                # seconds, and requests in that window already see the failure
+                inject_t = time.time()
+                phase["v"] = "fault"
                 fault.inject()
                 injected = True
-                fault_start = time.time()
-                phase["v"] = "fault"
+                fault_start = inject_t
                 self.store.update_run(run_id, fault_start=fault_start)
                 self.store.event("fault_injected", f"{cfg.fault_type} applied to {cfg.target} "
                                  f"for up to {cfg.duration_s}s", run_id, data=spec)
-                self._start_watchdog(spec, fault_start + cfg.duration_s + self.limits.watchdog_grace_s)
+                grace = self.limits.watchdog_grace_s + (60 if cfg.fault_type == config.FAULT_MEMORY else 0)
+                self._start_watchdog(spec, fault_start + cfg.duration_s + grace)
                 planned_end = fault_start + cfg.duration_s
                 self._set_live(state=RunState.ACTIVE.value, phase="fault", fault_start=fault_start,
-                               planned_end=planned_end, message="fault active; monitoring thresholds")
+                               planned_end=planned_end,
+                               message="fault active; self-healing agent must detect and fix it" if agent_mode
+                               else "fault active; monitoring thresholds")
                 while time.time() < planned_end:
                     k = self._killed()
                     if k:
                         abort_reason = k
                         self.store.event("manual_abort", k, run_id, "warning")
                         break
+                    if agent_mode and self._agent_fix.is_set():
+                        self._agent_fix.clear()
+                        try:
+                            gone, detail = fault.verify_removed()
+                        except Exception as e:  # noqa: BLE001
+                            gone, detail = False, f"{type(e).__name__}: {e}"
+                        if gone:
+                            remediated_by = "agent"
+                            self.store.event("agent_remediated", f"fault gone after the agent's runbook "
+                                             f"({self._agent_note}): {detail}", run_id)
+                            break
+                        self.store.event("agent_fix_ineffective", f"{self._agent_note}: the injected fault is "
+                                         f"still present ({detail})", run_id, "warning")
                     now = time.time()
                     window = [s for s in self.store.samples(run_id, since=now - cfg.thresholds.window_s - 1)
                               if s["phase"] == "fault"]
                     found = evaluate_thresholds(window, cfg.thresholds, now)
-                    if found:
+                    if found and agent_mode:
+                        if not observed_breaches:
+                            observed_breaches = [b.to_dict() for b in found]
+                            self.store.event("threshold_breach_observed", "; ".join(b.describe() for b in found)
+                                             + " (self-healing mode: no automatic abort; the fault ends when the "
+                                             "agent fixes it or at the planned end)", run_id, "warning",
+                                             data=observed_breaches)
+                    elif found:
                         breaches = [b.to_dict() for b in found]
                         abort_reason = "automatic abort: " + "; ".join(b.describe() for b in found)
                         self.store.event("threshold_breach", abort_reason, run_id, "error", data=breaches)
@@ -263,6 +315,13 @@ class Engine:
                 self.store.update_run(run_id, fault_end=fault_end)
                 outcome["fault_removal"] = {"verified": removal_ok, "notes": removal_notes,
                                             "at": fault_end}
+                if agent_mode:
+                    outcome["remediation"] = {
+                        "mode": "agent",
+                        "remediated_by": remediated_by or ("kill switch" if abort_reason and "kill" in abort_reason.lower()
+                                                           else "controller error" if abort_reason
+                                                           else "engine at the planned end"),
+                        "agent_note": self._agent_note or None, "observed_breaches": observed_breaches}
                 self._set_live(fault_end=fault_end)
 
             # ---- 6. recovery verification
@@ -346,7 +405,10 @@ class Engine:
             try:
                 target_ok = self.docker.inspect(spec["container_id"]).ok
             except DockerError:
-                target_ok = False
+                try:   # a recreated container (memory fault) has a new id
+                    target_ok = self.docker.resolve_service(spec["service"]).ok
+                except DockerError:
+                    target_ok = False
             rows = [s for s in self.store.samples(run_id, since=fault_end)
                     if s["probe"] in ("api_documents", "api_status")]
             streak = 0
@@ -400,6 +462,8 @@ class Engine:
                 state, result = RunState.ABORTED, "aborted_threshold"
             elif abort_reason:
                 state, result = RunState.ABORTED, "aborted"
+            elif (outcome.get("remediation") or {}).get("remediated_by") == "agent":
+                state, result = RunState.COMPLETED, "remediated_by_agent"
             else:
                 state, result = RunState.COMPLETED, "completed"
             failed_checks = [s for s in samples if not s["ok"]][-60:]

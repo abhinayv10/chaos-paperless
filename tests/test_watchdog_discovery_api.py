@@ -101,7 +101,7 @@ def make_client(store, docker, engine):
 def test_api_rejects_unapproved_target_and_extra_fields(store, docker, engine):
     with make_client(store, docker, engine) as c:
         r = c.post("/api/experiments", json={"target": "webserver", "duration_s": 10})
-        assert r.status_code == 400 and "not an approved" in r.json()["errors"][0]
+        assert r.status_code == 400 and "not permitted on 'webserver'" in r.json()["errors"][0]
         r = c.post("/api/experiments", json={"target": "db", "duration_s": 10, "command": "rm -rf /"})
         assert r.status_code == 422
         r = c.post("/api/experiments", json={"target": "db", "duration_s": 9999})
@@ -114,7 +114,7 @@ def test_api_preflight_catalog_graph_and_kill(store, docker, engine):
         pf = c.post("/api/experiments/preflight", json={"target": "db", "duration_s": 10}).json()
         assert pf["ok"], pf
         cat = c.get("/api/catalog").json()
-        assert set(cat["targets"]) == {"db", "broker"}
+        assert set(cat["targets"]) == {"db", "broker", "webserver"} and cat["targets"]["webserver"] == ["disk_exhaustion"]
         g = c.get("/api/graph").json()
         assert {n["id"] for n in g["nodes"]} >= {"webserver", "db", "broker"}
         docker.state["broker"]["paused"] = True
@@ -127,3 +127,17 @@ def test_api_blocked_state_returns_423(store, docker, engine):
     with make_client(store, docker, engine) as c:
         r = c.post("/api/experiments", json={"target": "db", "duration_s": 10})
         assert r.status_code == 423
+
+
+def test_api_metrics_summarises_recent_traffic(store, docker, engine):
+    from chaos.models import ProbeResult
+    import time as _t
+    now = _t.time()
+    for i in range(10):
+        store.add_sample("monitor", "idle", ProbeResult("web_root", i != 3, 100.0 + i, 200, "", now - 60 + i))
+    store.add_sample("exp-x", "fault", ProbeResult("doc_processing", True, 4000.0, None, "", now - 30))
+    with make_client(store, docker, engine) as c:
+        m = c.get("/api/metrics").json()
+    assert m["requests"]["total"] == 10 and m["requests"]["failed"] == 1
+    assert abs(m["requests"]["error_rate"] - 0.1) < 1e-9 and len(m["trend"]["rpm"]) == 12
+    assert m["processing"]["median_ms"] == 4000.0 and m["processing"]["count"] == 1

@@ -22,10 +22,18 @@ def test_valid_latency_config_is_allowed():
     assert validate_config(cfg(fault_type="network_latency", latency_ms=200)) == []
 
 
-@pytest.mark.parametrize("target", ["webserver", "postgres-prod", "host", "kube-apiserver"])
+@pytest.mark.parametrize("target", ["postgres-prod", "host", "kube-apiserver"])
 def test_unapproved_targets_are_rejected(target):
     errors = validate_config(cfg(target=target))
     assert errors and "not an approved sandbox resource" in errors[0]
+
+
+@pytest.mark.parametrize("fault", ["dependency_pause", "dependency_stop", "network_latency", "cpu_exhaustion"])
+def test_webserver_only_allows_filling_its_scratch_disk(fault):
+    extra = {"network_latency": {"latency_ms": 100}, "cpu_exhaustion": {"cpu_limit": 0.1}}.get(fault, {})
+    errors = validate_config(cfg(target="webserver", fault_type=fault, **extra))
+    assert errors and "not permitted on 'webserver'" in errors[0]
+    assert validate_config(cfg(target="webserver", fault_type="disk_exhaustion")) == []
 
 
 @pytest.mark.parametrize("target", ["db; rm -rf /", "../db", "DB", "db && docker kill", "$(id)", ""])

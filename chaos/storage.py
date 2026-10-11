@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS samples (
     status INTEGER, detail TEXT
 );
 CREATE INDEX IF NOT EXISTS samples_run ON samples(run_id, ts);
+CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
 CREATE TABLE IF NOT EXISTS health (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL, run_id TEXT NOT NULL, phase TEXT NOT NULL,
@@ -46,6 +47,12 @@ CREATE TABLE IF NOT EXISTS plans (
 );
 CREATE TABLE IF NOT EXISTS analyses (
     run_id TEXT PRIMARY KEY, created REAL NOT NULL, data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS incidents (
+    id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created REAL NOT NULL, data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS campaigns (
+    id TEXT PRIMARY KEY, created REAL NOT NULL, data TEXT NOT NULL
 );
 """
 
@@ -88,6 +95,12 @@ class Store:
             args.append(since)
         with self._conn() as c:
             return [dict(r) for r in c.execute(q + " ORDER BY ts", args)]
+
+    def samples_since(self, since: float) -> list[dict]:
+        """Every probe sample (monitor and experiments) newer than `since`."""
+        with self._conn() as c:
+            return [dict(r) for r in c.execute("SELECT ts, probe, ok, latency_ms FROM samples WHERE ts>=? ORDER BY ts",
+                                               (since,))]
 
     def add_health(self, run_id: str, phase: str, service: str, state: str, health: str,
                    ts: float | None = None) -> None:
@@ -135,6 +148,12 @@ class Store:
         with self._conn() as c:
             row = c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         return _decode_run(row) if row else None
+
+    def run_state(self, run_id: str) -> Optional[str]:
+        """Only the lifecycle state (used by the blind self-healing agent)."""
+        with self._conn() as c:
+            row = c.execute("SELECT state FROM runs WHERE id=?", (run_id,)).fetchone()
+        return row["state"] if row else None
 
     def list_runs(self, kind: str | None = None, limit: int = 50) -> list[dict]:
         q, args = "SELECT * FROM runs", []
@@ -221,6 +240,44 @@ class Store:
     def list_analyses(self) -> list[dict]:
         with self._conn() as c:
             rows = c.execute("SELECT data FROM analyses ORDER BY created").fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
+    # ---- self-healing agent incidents ---------------------------------------------
+    def save_incident(self, incident: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO incidents (id, run_id, created, data) VALUES (?,?,?,?)"
+                " ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                (incident["id"], incident["run_id"], incident.get("created") or time.time(),
+                 json.dumps(incident)),
+            )
+
+    def get_incident(self, incident_id: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT data FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def save_campaign(self, campaign: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO campaigns (id, created, data) VALUES (?,?,?)"
+                " ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                (campaign["id"], campaign.get("created") or time.time(), json.dumps(campaign)),
+            )
+
+    def get_campaign(self, campaign_id: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT data FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def list_campaigns(self, limit: int = 20) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT data FROM campaigns ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
+    def list_incidents(self, limit: int = 30) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT data FROM incidents ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
         return [json.loads(r["data"]) for r in rows]
 
     # ---- key/value state (active run marker, blocked flag, kill request) ------

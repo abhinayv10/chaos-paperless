@@ -44,13 +44,24 @@ FAULT_EFFECT = {
                         "connections stay open, so callers see hangs/timeouts rather than refused connections.",
     config.FAULT_LATENCY: "Adds a fixed delay to all egress packets of the target container (tc netem), "
                           "slowing every reply the target sends.",
+    config.FAULT_STOP: "Stops the target container (docker stop). The process is gone, so connections are closed and "
+                       "new ones are refused, unlike a pause where calls hang.",
+    config.FAULT_LOSS: "Drops a percentage of the target container's egress packets (tc netem loss), causing TCP "
+                       "retransmissions, stalls and timeouts.",
+    config.FAULT_CPU: "Caps the target container at a small CPU quota (docker update --cpus), so it stays up but "
+                      "cannot keep up with work.",
+    config.FAULT_REFUSE: "Rejects every connection to the target's service port (iptables), so clients fail "
+                         "immediately with connection refused/reset while the container keeps running.",
+    config.FAULT_MEMORY: "Squeezes the target into a memory limit below its working set, so its processes are "
+                         "OOM-killed and restarted; removed by recreating the container.",
+    config.FAULT_DISK: "Fills the web application's 64 MB upload scratch disk to 100%, so uploads cannot be written.",
 }
 
 
 def capabilities(limits: config.SafetyLimits = config.LIMITS) -> list[dict]:
     """One entry per fault type, with its permitted targets and parameter bounds."""
     caps = []
-    for fault in (config.FAULT_PAUSE, config.FAULT_LATENCY):
+    for fault in config.ALL_FAULTS:
         targets = sorted(t for t, allowed in limits.allowlist.items() if fault in allowed)
         if not targets:
             continue
@@ -58,6 +69,13 @@ def capabilities(limits: config.SafetyLimits = config.LIMITS) -> list[dict]:
         if fault == config.FAULT_LATENCY:
             params["latency_ms"] = {"min": limits.min_latency_ms, "max": limits.max_latency_ms,
                                     "required": True}
+        if fault == config.FAULT_LOSS:
+            params["loss_pct"] = {"min": limits.min_loss_pct, "max": limits.max_loss_pct, "required": True}
+        if fault == config.FAULT_MEMORY:
+            params["memory_mb"] = {"min": limits.min_memory_mb, "max": limits.max_memory_mb, "required": True}
+        if fault == config.FAULT_CPU:
+            params["cpu_limit"] = {"min": limits.min_cpu_limit, "max": limits.max_cpu_limit, "required": True,
+                                   "unit": "CPUs"}
         caps.append({"fault_type": fault, "label": FAULT_LABELS[fault], "effect": FAULT_EFFECT[fault],
                      "targets": targets, "parameters": params})
     return caps

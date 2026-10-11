@@ -108,6 +108,10 @@ def analyze_run(run: dict, edges: list[dict] | None = None) -> dict:
     if truncated and actual is not None:
         limitations.append(f"fault window truncated to {actual:.1f}s of the planned "
                            f"{cfg.get('duration_s')}s by an abort; later-stage effects were not observed")
+    healed = (out.get("remediation") or {}).get("remediated_by") == "agent"
+    if healed and actual is not None:
+        limitations.append(f"the self-healing agent removed the fault after {actual:.1f}s of the planned "
+                           f"{cfg.get('duration_s')}s; later-stage effects were not observed")
     for w in workflows:
         if w["status"] == "no_data":
             limitations.append(f"{w['workflow']}: {w['reason']}")
@@ -138,6 +142,9 @@ def analyze_run(run: dict, edges: list[dict] | None = None) -> dict:
         fact("fault", f"No fault was injected (run result: {out.get('result') or run.get('state')}).")
     if out.get("abort_reason"):
         fact("abort", f"The run was aborted: {out['abort_reason']}.")
+    if healed:
+        fact("remediation", f"The self-healing agent detected the failure and removed it with a predetermined "
+             f"runbook ({(out.get('remediation') or {}).get('agent_note')}).")
     if base_c and fault_c and base_c.get("n") and fault_c.get("n"):
         fact("metric", f"All critical probes: error rate {_pct(base_c['error_rate'])} at baseline -> "
              f"{_pct(fault_c['error_rate'])} during the fault (n={base_c['n']} -> {fault_c['n']}); "

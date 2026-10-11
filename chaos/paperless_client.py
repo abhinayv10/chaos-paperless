@@ -126,6 +126,15 @@ class PaperlessClient:
         res = self._timed("doc_upload", fn)
         return res, (task_id[0] if task_id else None)
 
+    def task_queue(self) -> int:
+        """Document tasks waiting for or being worked on by the worker."""
+        with self._client() as c:
+            r = c.get("/api/tasks/", params={"acknowledged": "false"}, headers=self._auth())
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("results", []) if isinstance(data, dict) else data
+        return sum(1 for t in items if str(t.get("status", "")).upper() in ("PENDING", "STARTED", "RECEIVED"))
+
     def task_status(self, task_id: str) -> Optional[dict]:
         with self._client() as c:
             r = c.get("/api/tasks/", params={"task_id": task_id}, headers=self._auth())

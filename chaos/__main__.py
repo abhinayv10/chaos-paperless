@@ -438,7 +438,7 @@ def cmd_serve(a) -> int:
     import uvicorn
     from .api import create_app
     print(f"dashboard: http://127.0.0.1:{a.port}")
-    uvicorn.run(create_app(), host="127.0.0.1", port=a.port, log_level="warning")
+    uvicorn.run(create_app(agent_default=True), host="127.0.0.1", port=a.port, log_level="warning")
     return 0
 
 

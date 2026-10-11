@@ -41,6 +41,27 @@ def validate_config(cfg: ExperimentConfig, limits: config.SafetyLimits = config.
             errors.append(f"latency {cfg.latency_ms}ms outside [{limits.min_latency_ms}, {limits.max_latency_ms}]ms")
     elif cfg.latency_ms is not None:
         errors.append("latency_ms is only valid for network_latency")
+    if cfg.fault_type == config.FAULT_LOSS:
+        if cfg.loss_pct is None:
+            errors.append("loss_pct is required for packet_loss")
+        elif not limits.min_loss_pct <= cfg.loss_pct <= limits.max_loss_pct:
+            errors.append(f"packet loss {cfg.loss_pct}% outside [{limits.min_loss_pct}, {limits.max_loss_pct}]%")
+    elif cfg.loss_pct is not None:
+        errors.append("loss_pct is only valid for packet_loss")
+    if cfg.fault_type == config.FAULT_CPU:
+        if cfg.cpu_limit is None:
+            errors.append("cpu_limit is required for cpu_exhaustion")
+        elif not limits.min_cpu_limit <= cfg.cpu_limit <= limits.max_cpu_limit:
+            errors.append(f"cpu limit {cfg.cpu_limit} outside [{limits.min_cpu_limit}, {limits.max_cpu_limit}] CPUs")
+    elif cfg.cpu_limit is not None:
+        errors.append("cpu_limit is only valid for cpu_exhaustion")
+    if cfg.fault_type == config.FAULT_MEMORY:
+        if cfg.memory_mb is None:
+            errors.append("memory_mb is required for memory_exhaustion")
+        elif not limits.min_memory_mb <= cfg.memory_mb <= limits.max_memory_mb:
+            errors.append(f"memory limit {cfg.memory_mb} MB outside [{limits.min_memory_mb}, {limits.max_memory_mb}] MB")
+    elif cfg.memory_mb is not None:
+        errors.append("memory_mb is only valid for memory_exhaustion")
     t = cfg.thresholds
     if not limits.min_latency_threshold_ms <= t.max_p95_latency_ms <= limits.max_latency_threshold_ms:
         errors.append(f"latency threshold {t.max_p95_latency_ms}ms outside "

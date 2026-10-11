@@ -39,6 +39,20 @@ def docker_bin() -> str:
 # Fault types the controller knows how to inject and remove.
 FAULT_PAUSE = "dependency_pause"
 FAULT_LATENCY = "network_latency"
+FAULT_STOP = "dependency_stop"
+FAULT_LOSS = "packet_loss"
+FAULT_CPU = "cpu_exhaustion"
+FAULT_REFUSE = "connection_refused"
+FAULT_MEMORY = "memory_exhaustion"
+FAULT_DISK = "disk_exhaustion"
+# faults on a dependency (db / broker)
+DEP_FAULTS = (FAULT_PAUSE, FAULT_STOP, FAULT_LATENCY, FAULT_LOSS, FAULT_CPU, FAULT_REFUSE, FAULT_MEMORY)
+ALL_FAULTS = DEP_FAULTS + (FAULT_DISK,)
+# the TCP port each dependency serves (connection_refused rejects it)
+SERVICE_PORTS = {"db": 5432, "broker": 6379}
+# 64 MB tmpfs volume mounted as Paperless' scratch dir (see sandbox/docker-compose.yml)
+SCRATCH_VOLUME = f"{COMPOSE_PROJECT}_scratch"
+SCRATCH_FILL = "chaos-fill"
 
 
 @dataclass(frozen=True)
@@ -49,14 +63,24 @@ class SafetyLimits:
     # system under observation and is deliberately not a permitted target.
     allowlist: dict[str, frozenset[str]] = field(
         default_factory=lambda: {
-            "db": frozenset({FAULT_PAUSE, FAULT_LATENCY}),
-            "broker": frozenset({FAULT_PAUSE, FAULT_LATENCY}),
+            "db": frozenset(DEP_FAULTS),
+            "broker": frozenset(DEP_FAULTS),
+            # the webserver itself is never disturbed; only its bounded scratch volume is filled
+            "webserver": frozenset({FAULT_DISK}),
         }
     )
     min_duration_s: int = 5
     max_duration_s: int = 120
     min_latency_ms: int = 10
     max_latency_ms: int = 3000
+    min_loss_pct: int = 1
+    max_loss_pct: int = 60
+    # CPU quota for cpu_exhaustion, in CPUs (docker update --cpus); restored to unlimited
+    min_cpu_limit: float = 0.02
+    max_cpu_limit: float = 0.5
+    # memory limit for memory_exhaustion, in MB; removed by recreating the container
+    min_memory_mb: int = 6
+    max_memory_mb: int = 256
     # bounds for user-configurable abort thresholds
     max_error_rate_ceiling: float = 1.0
     min_latency_threshold_ms: int = 100

@@ -10,16 +10,14 @@
 <header class="topbar">
   <div class="brand">
     <strong>Paperless Chaos Lab</strong>
-    <span class="muted small">AI-driven chaos engineering</span>
+    <span class="muted small">Resilience testing with a self-healing agent</span>
   </div>
   <nav class="tabs" role="tablist">
-    <button data-tab="overview" class="active"><b>1</b> Overview</button>
-    <button data-tab="experiments"><b>2</b> Experiments</button>
-    <button data-tab="findings"><b>3</b> Findings</button>
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="campaign">Scan &amp; inject</button>
   </nav>
   <div class="topstate">
-    <span id="conn" class="pill">connecting…</span>
-    <span id="ai-pill" class="pill">planner: …</span>
+    <span id="state-pill" class="pill">connecting…</span>
     <button id="kill" class="kill" title="Abort any running experiment and remove every fault now">■ KILL SWITCH</button>
   </div>
 </header>
@@ -32,30 +30,31 @@
 <main>
   <!-- ======================================================== OVERVIEW -->
   <section id="tab-overview" class="tab active">
-    <div class="card hero">
-      <div class="hero-main">
-        <div id="hero-status" class="hero-status">–</div>
-        <p id="hero-text" class="hero-text"></p>
-        <div id="hero-health" class="hero-health"></div>
+    <div class="card healthbar">
+      <div class="hb-main">
+        <div id="ov-status" class="hero-status">–</div>
+        <p id="ov-text" class="muted"></p>
       </div>
-      <div class="hero-score">
-        <div class="label">Resilience score</div>
-        <div id="hero-score" class="value">–</div>
-        <div id="hero-cov" class="small muted"></div>
-        <button id="hero-cta" class="primary" data-go="experiments">Run an experiment →</button>
+      <ul class="hb-comps" id="ov-comps" aria-label="Component health"></ul>
+      <div class="hb-score">
+        <div class="k">Resilience</div>
+        <div class="v" id="ov-score">–</div>
+        <div class="small muted" id="ov-cov"></div>
       </div>
     </div>
 
+    <div class="metrics" id="ov-metrics"></div>
+
     <div class="card">
-      <h2 id="story-title">What happened</h2>
-      <ol class="story" id="story-ov"></ol>
+      <div class="row between"><h2>Resource use</h2><span class="small muted">live from Docker, every 15 s</span></div>
+      <div class="tblwrap"><table class="tbl res" id="ov-res"><thead><tr><th>Component</th><th>CPU</th><th>Memory</th><th>Limits</th></tr></thead><tbody></tbody></table></div>
     </div>
 
     <div class="grid split">
       <div class="card">
         <h2>What the application depends on <span class="muted small" id="ov-graph-note"></span></h2>
         <div id="ov-graph" class="graph"></div>
-        <h2 class="mt">Effect on each user workflow</h2>
+        <h2 class="mt">Effect on each user workflow <span class="muted small" id="wf-note"></span></h2>
         <div id="wf-ov"></div>
       </div>
       <div class="card">
@@ -69,112 +68,88 @@
     </div>
   </section>
 
-  <!-- ======================================================== EXPERIMENTS -->
-  <section id="tab-experiments" class="tab">
-    <div class="card">
-      <div class="row between">
-        <h2 id="now-title">Current experiment</h2>
-        <span id="now-status"></span>
-      </div>
-      <ol class="story compact" id="story-ex"></ol>
-    </div>
-
-    <div class="card">
-      <div class="row between">
-        <div>
-          <h2>Experiment plan, ranked by priority</h2>
-          <div class="small muted" id="pl-source"></div>
-        </div>
-        <button id="pl-generate">Generate new plan</button>
-      </div>
-      <div id="pl-notice" class="note" hidden></div>
-      <div id="pl-empty" class="empty" hidden>No plan yet. Click “Generate new plan” to get ranked experiments.</div>
-      <div id="pl-recs" class="plan"></div>
-      <div id="pl-rejected" class="banner warning" hidden></div>
-      <div class="row mt" style="align-items:center">
-        <button id="pl-run" class="primary big">Approve &amp; run selected</button>
-        <span class="small muted" id="pl-seq"></span>
-      </div>
-    </div>
-
-    <details class="card">
-      <summary>Run history and details</summary>
-      <div class="row between mt">
-        <label class="small">Run <select id="obs-run"></select></label>
-        <span class="small"><a id="obs-report" target="_blank">text report ↗</a> · <a id="obs-export" target="_blank">evidence JSON ↗</a></span>
-      </div>
-      <div id="obs-empty" class="empty" hidden>No runs recorded yet.</div>
-      <div id="obs-latency" class="chart"></div>
-      <div class="grid cols-2">
-        <div>
-          <h3>Before / during / after</h3>
-          <div class="tblwrap scroll"><table class="tbl" id="obs-phases"><thead><tr><th>Phase</th><th>Probe</th><th>n</th><th>Error rate</th><th>p50</th><th>p95</th></tr></thead><tbody></tbody></table></div>
-        </div>
-        <div>
-          <h3>Rollback and recovery</h3>
-          <div id="obs-recovery"></div>
-          <h3 class="mt">Container logs</h3>
-          <div id="obs-logs"></div>
-        </div>
-      </div>
-    </details>
-
-    <details class="card">
-      <summary>Manual experiment and baseline</summary>
-      <form id="exp-form" class="form mt">
-        <div class="row">
-          <label>Name <input name="name" value="manual experiment" maxlength="80"></label>
-          <label>Failure type <select name="fault_type"></select></label>
-          <label>Target <select name="target"></select></label>
-          <label>Duration (s) <input name="duration_s" type="number" value="20"></label>
-          <label class="lat-only" hidden>Latency (ms) <input name="latency_ms" type="number" value="300"></label>
-        </div>
-        <label>Hypothesis <input name="hypothesis" maxlength="400" value=""></label>
-        <div class="row">
-          <label>Abort at error rate (%) <input name="max_error_rate" type="number" value="80" min="1" max="100"></label>
-          <label>Abort at p95 (ms) <input name="max_p95_latency_ms" type="number" value="6000"></label>
-          <label>Window (s) <input name="window_s" type="number" value="10"></label>
-          <label>Min samples <input name="min_samples" type="number" value="3"></label>
-          <label>Recovery timeout (s) <input name="recovery_timeout_s" type="number" value="90"></label>
-        </div>
-        <p class="muted small" id="limits-desc"></p>
+  <!-- ======================================================== SCAN & INJECT -->
+  <section id="tab-campaign" class="tab">
+    <div class="card hero">
+      <div class="hero-main">
+        <div class="page-head"><h1>Resilience campaign</h1><span id="cp-status" class="pill"></span></div>
+        <p id="cp-text" class="hero-text"></p>
         <div class="row" style="align-items:center">
-          <button type="button" id="btn-preflight">Run preflight checks</button>
-          <button type="submit" id="btn-start" class="primary">Start experiment</button>
-          <span class="small muted">or</span>
-          <label class="small inline">baseline only <input id="base-dur" type="number" min="10" max="300" value="30" class="w60">s</label>
-          <button type="button" id="run-baseline">Run baseline</button>
+          <button id="cp-start" class="primary big">Start resilience scan</button>
+          <button id="cp-cancel" hidden>Cancel</button>
+          <span class="small muted" id="cp-meta"></span>
         </div>
-      </form>
-      <div id="exp-errors" class="banner warning" hidden></div>
-      <ul class="checks" id="preflight"></ul>
-    </details>
-  </section>
+      </div>
+      <div class="hl-kpis" id="cp-kpis"></div>
+    </div>
 
-  <!-- ======================================================== FINDINGS -->
-  <section id="tab-findings" class="tab">
-    <div class="grid fd-top">
-      <div class="card" id="fd-score"></div>
+    <div class="card">
+      <h2>Campaign graph <span class="muted small">LangGraph: scan → AI ranks → AI selects → you confirm → agent injects → self-healing → report</span></h2>
+      <ol class="flow cp-flow" id="cp-flow"></ol>
+    </div>
+
+    <div class="grid split">
       <div class="card">
-        <div class="row between">
-          <h2>Weaknesses found, worst first</h2>
-          <span class="row" style="align-items:center">
-            <button id="fd-analyze-all">Analyse new runs</button>
-            <a href="/api/report" target="_blank" class="small">full report ↗</a>
-          </span>
-        </div>
-        <table class="tbl roomy" id="fd-summary"><thead><tr><th>#</th><th>Failure tested</th><th>Severity</th><th>Impact</th><th>Recovery</th></tr></thead><tbody></tbody></table>
-        <p class="muted small" id="fd-note"></p>
+        <h2>1 · Resilience scan <span class="tag">live measurements, read-only</span></h2>
+        <ol class="scan" id="cp-scan"><li class="muted">Start a scan to probe the live application.</li></ol>
+      </div>
+      <div class="card">
+        <h2>2 · Weak points, ranked <span id="cp-rank-src"></span></h2>
+        <div id="cp-findings"><div class="empty">The ranked findings appear after the scan.</div></div>
       </div>
     </div>
-    <div id="fd-notice" class="note" hidden></div>
-    <div id="fd-empty" class="empty" hidden>No analysed experiment yet. Run the plan on the Experiments tab.</div>
-    <div id="fd-list"></div>
-    <details class="card" id="fd-other-wrap" hidden><summary>Earlier and inconclusive runs</summary><div id="fd-other"></div></details>
-    <details class="card">
-      <summary>How the scores are computed</summary>
-      <pre class="logs" id="fd-method"></pre>
-    </details>
+
+    <div class="card">
+      <div class="row between">
+        <h2>3 · Experiments to inject <span id="cp-sel-src"></span></h2>
+        <span class="small muted" id="cp-sel-note"></span>
+      </div>
+      <div id="cp-select"><div class="empty">The AI proposes at least 3 experiments after ranking. Nothing is injected until you confirm.</div></div>
+      <div class="row mt" style="align-items:center">
+        <button id="cp-confirm" class="primary big" hidden>Approve &amp; inject</button>
+        <span class="small muted" id="cp-confirm-note"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row between">
+        <h2 id="cp-live-title">4 · How the website reacts</h2>
+        <span id="cp-live-status"></span>
+      </div>
+      <div class="incident" id="cp-moments"></div>
+      <div class="legend small" id="lg-cp"></div>
+      <div id="cp-chart" class="chart"><div class="empty">The live chart appears when an experiment runs.</div></div>
+      <div id="cp-wf" class="mt"></div>
+
+      <div class="grid split mt" id="cp-agent">
+        <div class="subcard">
+          <h3>What the agent measured</h3>
+          <p class="small muted" id="hl-detect-note"></p>
+          <div class="tblwrap"><table class="tbl" id="hl-anoms"><thead><tr><th>ID</th><th>Signal</th><th>Normal</th><th>Now</th><th>Change</th></tr></thead><tbody></tbody></table></div>
+          <h3 class="mt">Still normal</h3>
+          <ul class="plain sigs" id="hl-normals"></ul>
+        </div>
+        <div class="subcard">
+          <div class="row between"><h3>Diagnosis</h3><span id="hl-diag-src"></span></div>
+          <div id="hl-diag"><div class="empty">No failure diagnosed yet.</div></div>
+        </div>
+      </div>
+      <div class="grid split">
+        <div class="subcard">
+          <h3>Fix · predetermined runbook, chosen by rule</h3>
+          <div id="hl-runbook"><div class="empty">No runbook selected yet.</div></div>
+        </div>
+        <div class="subcard">
+          <h3>Verification</h3>
+          <div id="hl-verify"><div class="empty">Nothing to verify yet.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row between"><h2>5 · Findings</h2><span class="small muted">filled in as each experiment finishes · worst first</span></div>
+      <div class="tblwrap"><table class="tbl ftable" id="cp-ftable"><thead><tr><th>Weak point</th><th>Tested by</th><th>Verdict</th><th>What happened</th><th>Self-healing</th><th>Recommended fix</th></tr></thead><tbody></tbody></table></div>
+    </div>
   </section>
 </main>
 <div id="tip" class="tip" hidden></div>

@@ -13,11 +13,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import catalog as experiment_catalog
-from . import config, llm, pipeline
+from . import config, detection, llm, pipeline, runbooks
 from .discovery import discover, load_overrides, save_overrides
 from .docker_ops import Docker
 from .engine import Engine, ExperimentRejected
 from .evidence import build_evidence
+from .grading import grade_incident
+from .campaign import CampaignBusy, CampaignRunner
+from .healer import GRAPH_NODES, Healer
 from .models import FAULT_LABELS, ExperimentConfig
 from .monitor import MONITOR_RUN, Monitor
 from .orchestrator import Orchestrator
@@ -47,11 +50,27 @@ class PlanRunRequest(BaseModel):
     ranks: Optional[list[int]] = Field(None, max_length=20)
 
 
+class AgentSetting(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+
+
+class CampaignConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    approved: list[str] = Field(..., max_length=10)
+
+
 AUTO = "auto"
+AGENT_KEY = "agent_mode"
+# the agent needs time to learn, detect, ask the model and verify; shorter
+# faults would end at the engine's deadline before the agent could act
+AGENT_MIN_DURATION_S = 90
 
 
 def create_app(store: Store | None = None, docker: Docker | None = None, engine: Engine | None = None,
-               start_monitor: bool = True, provider=AUTO, settle_s: float | None = None) -> FastAPI:
+               start_monitor: bool = True, provider=AUTO, settle_s: float | None = None,
+               healer_kwargs: dict | None = None, agent_min_duration_s: int = AGENT_MIN_DURATION_S,
+               agent_default: bool = False, scan_rounds: int = 5) -> FastAPI:
     store = store or Store()
     docker = docker or Docker()
     engine = engine or Engine(store, docker, PaperlessClient)
@@ -67,11 +86,37 @@ def create_app(store: Store | None = None, docker: Docker | None = None, engine:
             store.event("ai_config_error", str(e), level="warning")
             return None
 
+    healer = Healer(store, docker, get_provider, notify=engine.agent_remediated, **(healer_kwargs or {}))
+    engine.on_start = healer.watch
+
+    def agent_enabled() -> bool:
+        v = store.kv_get(AGENT_KEY)
+        return agent_default if v is None else bool(v.get("enabled"))
+
+    def prepare(cfg: ExperimentConfig, explicit: bool = False) -> ExperimentConfig:
+        """Self-healing mode on: hold the fault for the agent, long enough to act."""
+        if explicit or not agent_enabled():
+            return cfg
+        return cfg.model_copy(update={"remediation": "agent",
+                                      "duration_s": max(cfg.duration_s, agent_min_duration_s)})
+
     def analyze_run(run_id: str) -> dict:
+        healer.wait(timeout=45)   # let the agent close its incident before the post-run analysis
         return pipeline.analyze_and_export(store, run_id, discover(docker), get_provider())
 
-    orchestrator = Orchestrator(engine, store, after_run=analyze_run,
+    orchestrator = Orchestrator(engine, store, after_run=analyze_run, prepare=prepare,
                                 **({} if settle_s is None else {"settle_s": settle_s}))
+
+    def campaign_wait(run_id: str) -> None:
+        engine.wait()
+        try:
+            analyze_run(run_id)   # also waits for the self-healing agent to close its incident
+        except Exception as e:  # noqa: BLE001 - analysis failure never affects the campaign's safety
+            store.event("analysis_error", f"{type(e).__name__}: {e}", run_id, "warning")
+
+    campaigns = CampaignRunner(store, docker, engine.client_factory, get_provider, engine.start, campaign_wait,
+                               busy_fn=lambda: engine.busy() or orchestrator.running(),
+                               duration_s=agent_min_duration_s, scan_rounds=scan_rounds)
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         report = engine.recover_on_startup()
@@ -82,13 +127,14 @@ def create_app(store: Store | None = None, docker: Docker | None = None, engine:
             yield
         finally:
             monitor.stop()
+            healer.stop()
             orchestrator.stop("controller shutting down")
             if engine.running_here():
                 engine.kill("controller shutting down")
 
     app = FastAPI(title="Paperless chaos controller", version="day2", lifespan=lifespan)
     app.state.engine, app.state.store, app.state.monitor = engine, store, monitor
-    app.state.orchestrator = orchestrator
+    app.state.orchestrator, app.state.healer, app.state.campaigns = orchestrator, healer, campaigns
 
     # ---------------------------------------------------------------- overview
     @app.get("/api/overview")
@@ -101,6 +147,58 @@ def create_app(store: Store | None = None, docker: Docker | None = None, engine:
             "experiment": current(),
             "safety": safety(),
             "limits": catalog()["limits"],
+        }
+
+    @app.get("/api/metrics")
+    def metrics():
+        """The website's basic metrics over the last 15 minutes, with 12-point trends."""
+        now, span, buckets = time.time(), 900.0, 12
+        width = span / buckets
+        rows = store.samples_since(now - span)
+        reqs = [r for r in rows if r["probe"] != "doc_processing"]
+        # documents are only uploaded during experiments: look further back for processing times
+        procs = [r for r in store.samples_since(now - 6 * 3600) if r["probe"] == "doc_processing" and r["ok"]]
+
+        def median(vals):
+            vals = sorted(vals)
+            return vals[len(vals) // 2] if vals else None
+
+        def p95(vals):
+            vals = sorted(vals)
+            return vals[min(len(vals) - 1, int(0.95 * len(vals)))] if vals else None
+
+        trend = {"rpm": [], "error_rate": [], "median_ms": [], "processing_ms": []}
+        for i in range(buckets):
+            lo = now - span + i * width
+            b = [r for r in reqs if lo <= r["ts"] < lo + width]
+            trend["rpm"].append(round(len(b) / (width / 60), 1))
+            trend["error_rate"].append(round(sum(1 for r in b if not r["ok"]) / len(b), 3) if b else 0)
+            trend["median_ms"].append(median([r["latency_ms"] for r in b]) or 0)
+        recent = procs[-buckets * 3:]
+        for i in range(0, len(recent), 3):
+            trend["processing_ms"].append(median([r["latency_ms"] for r in recent[i:i + 3]]) or 0)
+        hist = list(monitor.history)
+        docs = [h["documents"] for h in hist if h["documents"] is not None]
+        queue = [h["queue"] for h in hist if h["queue"] is not None]
+        step = max(1, len(hist) // buckets)
+        lat = [r["latency_ms"] for r in reqs]
+        return {
+            "now": now, "window_s": span,
+            "requests": {"per_min": round(len(reqs) / (span / 60), 1), "total": len(reqs),
+                         "failed": sum(1 for r in reqs if not r["ok"]),
+                         "error_rate": (sum(1 for r in reqs if not r["ok"]) / len(reqs)) if reqs else None,
+                         "median_ms": median(lat), "p95_ms": p95(lat)},
+            "processing": {"median_ms": median([r["latency_ms"] for r in procs[-30:]]), "count": len(procs[-30:]),
+                           "last_ts": procs[-1]["ts"] if procs else None},
+            "documents": {"count": docs[-1] if docs else None,
+                          "change": (docs[-1] - docs[0]) if len(docs) > 1 else None,
+                          "trend": docs[::step][-buckets:]},
+            "queue": {"length": queue[-1] if queue else None, "trend": queue[::step][-buckets:]},
+            "trend": trend,
+            "services": monitor.latest.get("services", []),
+            "resources": monitor.resources,
+            "disk": monitor.disk,
+            "client_timeout_s": 5.0,
         }
 
     @app.get("/api/monitor")
@@ -177,7 +275,7 @@ def create_app(store: Store | None = None, docker: Docker | None = None, engine:
 
     @app.post("/api/experiments")
     def start(payload: dict = Body(...)):
-        cfg = _parse(payload)
+        cfg = prepare(_parse(payload), explicit="remediation" in payload)
         try:
             run_id = engine.start(cfg)
         except ExperimentRejected as e:
@@ -212,7 +310,96 @@ def create_app(store: Store | None = None, docker: Docker | None = None, engine:
     @app.post("/api/kill")
     def kill():
         orchestrator.stop("manual kill switch")  # no further planned experiments start
+        campaigns._stop.set()                     # nor further campaign experiments
+        healer.stop()
         return engine.kill("manual kill switch (dashboard/API)")
+
+    # ---------------------------------------------------------------- self-healing agent
+    @app.get("/api/agent")
+    def agent_status():
+        return {
+            "enabled": agent_enabled(), "watching": healer.running(),
+            "min_duration_s": agent_min_duration_s, "graph": GRAPH_NODES,
+            "failure_classes": detection.FAILURE_CLASSES,
+            "runbooks": [{"failure_class": k, **v} for k, v in runbooks.RUNBOOKS.items()],
+            "detection": {"window_s": detection.WINDOW_S, "error_min": detection.ERR_MIN,
+                          "error_rise": detection.ERR_RISE, "min_failures": detection.MIN_FAILURES,
+                          "latency_ratio": detection.LAT_RATIO, "latency_min_delta_ms": detection.LAT_MIN_DELTA_MS,
+                          "confirm_checks": detection.CONFIRM_TICKS},
+            "probe_depends": detection.PROBE_DEPENDS,
+            "ai": llm.describe(get_provider()),
+        }
+
+    @app.post("/api/agent")
+    def set_agent(s: AgentSetting):
+        store.kv_set(AGENT_KEY, {"enabled": s.enabled})
+        store.event("agent_mode", f"self-healing mode {'enabled' if s.enabled else 'disabled'}")
+        return agent_status()
+
+    # ---------------------------------------------------------------- campaign (scan -> select -> confirm -> inject)
+    @app.post("/api/campaign")
+    def campaign_start():
+        try:
+            return {"ok": True, "id": campaigns.start()}
+        except CampaignBusy as e:
+            return JSONResponse(status_code=409, content={"ok": False, "errors": [str(e)]})
+
+    @app.get("/api/campaign/latest")
+    def campaign_latest():
+        items = store.list_campaigns(1)
+        return {"campaign": items[0] if items else None, "running": campaigns.running(),
+                "awaiting": campaigns.awaiting()}
+
+    @app.get("/api/campaign/{campaign_id}")
+    def campaign_get(campaign_id: str):
+        doc = store.get_campaign(campaign_id)
+        if not doc:
+            raise HTTPException(404, "campaign not found")
+        return {"campaign": doc, "running": campaigns.running() and campaigns.current == campaign_id}
+
+    @app.post("/api/campaign/{campaign_id}/confirm")
+    def campaign_confirm(campaign_id: str, req: CampaignConfirm):
+        try:
+            campaigns.confirm(campaign_id, req.approved)
+        except CampaignBusy as e:
+            return JSONResponse(status_code=409, content={"ok": False, "errors": [str(e)]})
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"ok": False, "errors": [str(e)]})
+        store.event("campaign_confirmed", f"{campaign_id}: approved {', '.join(req.approved)}")
+        return {"ok": True}
+
+    @app.post("/api/campaign/{campaign_id}/cancel")
+    def campaign_cancel(campaign_id: str):
+        try:
+            campaigns.cancel(campaign_id)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"ok": False, "errors": [str(e)]})
+        return {"ok": True}
+
+    @app.get("/api/incidents")
+    def incidents(limit: int = 30):
+        out = []
+        for inc in store.list_incidents(min(limit, 100)):
+            atts = inc.get("attempts") or []
+            out.append({k: inc.get(k) for k in ("id", "run_id", "created", "status", "detected_at",
+                                                "resolved_at", "ended")}
+                       | {"attempts": len(atts), "mode": atts[-1]["source"]["mode"] if atts else None,
+                          "grade": grade_incident(store, inc)})
+        return out
+
+    @app.get("/api/incidents/latest")
+    def latest_incident():
+        items = store.list_incidents(1)
+        if not items:
+            return {"incident": None}
+        return {"incident": items[0], "grade": grade_incident(store, items[0])}
+
+    @app.get("/api/incidents/{incident_id}")
+    def incident(incident_id: str):
+        inc = store.get_incident(incident_id)
+        if not inc:
+            raise HTTPException(404, "incident not found")
+        return {"incident": inc, "grade": grade_incident(store, inc)}
 
     # ---------------------------------------------------------------- AI planner (agent 1)
     @app.get("/api/ai/status")

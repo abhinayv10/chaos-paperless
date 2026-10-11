@@ -24,11 +24,17 @@ from .models import ExperimentConfig, Thresholds
 from .safety import validate_config
 from .storage import Store
 
-MAX_RECOMMENDATIONS = 8
+MAX_RECOMMENDATIONS = 20
 DEFAULT_DURATION_S = 20
 DEFAULT_LATENCY_MS = 300
 DEFAULT_ABORT_ERROR_RATE = 0.8
 DEFAULT_ABORT_P95_MS = 6000
+DEFAULT_LOSS_PCT = 30
+DEFAULT_CPU_LIMIT = 0.05
+DEFAULT_MEMORY_MB = {"db": 24, "broker": 6}
+FAULT_WEIGHT = {config.FAULT_PAUSE: 1.0, config.FAULT_STOP: 0.95, config.FAULT_LATENCY: 0.7,
+                config.FAULT_LOSS: 0.75, config.FAULT_CPU: 0.65, config.FAULT_REFUSE: 0.9,
+                config.FAULT_MEMORY: 0.7, config.FAULT_DISK: 0.6}
 
 
 class Recommendation(BaseModel):
@@ -39,10 +45,14 @@ class Recommendation(BaseModel):
 
     rank: int = Field(..., ge=1, le=50)
     name: str = Field(..., min_length=1, max_length=80)
-    fault_type: Literal["dependency_pause", "network_latency"]
+    fault_type: Literal["dependency_pause", "dependency_stop", "network_latency", "packet_loss", "cpu_exhaustion",
+                        "connection_refused", "memory_exhaustion", "disk_exhaustion"]
     target: str = Field(..., pattern=r"^[a-z0-9][a-z0-9_-]{0,40}$")
     duration_s: int
     latency_ms: Optional[int] = None
+    loss_pct: Optional[int] = None
+    cpu_limit: Optional[float] = None
+    memory_mb: Optional[int] = None
     abort_max_error_rate: float = DEFAULT_ABORT_ERROR_RATE
     abort_max_p95_latency_ms: int = DEFAULT_ABORT_P95_MS
     hypothesis: str = Field(..., min_length=1, max_length=400)
@@ -58,6 +68,7 @@ def to_config(rec: dict) -> ExperimentConfig:
     return ExperimentConfig(
         name=rec["name"], hypothesis=rec["hypothesis"], fault_type=rec["fault_type"],
         target=rec["target"], duration_s=rec["duration_s"], latency_ms=rec.get("latency_ms"),
+        loss_pct=rec.get("loss_pct"), cpu_limit=rec.get("cpu_limit"), memory_mb=rec.get("memory_mb"),
         thresholds=Thresholds(max_error_rate=rec["abort_max_error_rate"],
                               max_p95_latency_ms=rec["abort_max_p95_latency_ms"]),
     )
@@ -88,7 +99,8 @@ def validate_plan(raw: object, graph: dict, limits: config.SafetyLimits = config
             errors += [f"unknown workflow '{w}'" for w in rec["workflows"] if w not in catalog.WORKFLOWS]
             errors += [f"dependency '{d}' is not in the discovered dependency map"
                        for d in rec["dependencies"] if d not in nodes]
-            key = (rec["fault_type"], rec["target"], rec["duration_s"], rec["latency_ms"])
+            key = (rec["fault_type"], rec["target"], rec["duration_s"], rec["latency_ms"], rec["loss_pct"],
+                   rec["cpu_limit"], rec["memory_mb"])
             if key in seen:
                 errors.append("duplicate of a higher-ranked recommendation")
             seen.add(key)
@@ -162,10 +174,11 @@ weakness was found or the run was truncated/inconclusive, and deprioritise scena
 
 Reply with one JSON object and nothing else:
 {"recommendations": [{"rank": 1, "name": "short title", "fault_type": "...", "target": "...",
-  "duration_s": 20, "latency_ms": null, "abort_max_error_rate": 0.8, "abort_max_p95_latency_ms": 6000,
+  "duration_s": 20, "latency_ms": null, "loss_pct": null, "cpu_limit": null, "memory_mb": null, "abort_max_error_rate": 0.8, "abort_max_p95_latency_ms": 6000,
   "hypothesis": "...", "rationale": "why this rank", "expected_effects": ["..."],
   "dependencies": ["..."], "workflows": ["..."], "risks": ["..."]}]}
-Use latency_ms only for network_latency (required there). Give 3 to 6 recommendations, no duplicates."""
+Use latency_ms only for network_latency, loss_pct only for packet_loss, cpu_limit only for cpu_exhaustion and \
+memory_mb only for memory_exhaustion (each required for its fault, null otherwise). Give 3 to 6 recommendations, no duplicates."""
 
 
 # ---------------------------------------------------------------- rules fallback
@@ -181,7 +194,7 @@ def rules_plan(context: dict) -> dict:
             fault = cap["fault_type"]
             flows = catalog.workflows_through(target)
             reach = sum(catalog.WORKFLOWS[w]["criticality"] for w in flows)
-            score = reach * (1.0 if fault == config.FAULT_PAUSE else 0.7)
+            score = reach * FAULT_WEIGHT.get(fault, 0.7)
             prior = [h for h in hist if h["fault_type"] == fault and h["target"] == target and h["injected"]]
             if not prior:
                 score += 0.5
@@ -197,10 +210,21 @@ def rules_plan(context: dict) -> dict:
                 score -= 0.2
                 why = f"last run {prior[0]['run_id']} showed {prior[0]['severity']} severity and clean recovery"
             lat = DEFAULT_LATENCY_MS if fault == config.FAULT_LATENCY else None
-            verb = "hangs" if fault == config.FAULT_PAUSE else f"answers {lat}ms slower"
+            loss = DEFAULT_LOSS_PCT if fault == config.FAULT_LOSS else None
+            cpu = DEFAULT_CPU_LIMIT if fault == config.FAULT_CPU else None
+            mem = DEFAULT_MEMORY_MB.get(target, 32) if fault == config.FAULT_MEMORY else None
+            verb = {config.FAULT_PAUSE: "hangs", config.FAULT_STOP: "is stopped",
+                    config.FAULT_LATENCY: f"answers {lat}ms slower", config.FAULT_LOSS: f"loses {loss}% of packets",
+                    config.FAULT_CPU: f"is capped at {cpu} CPU", config.FAULT_REFUSE: "refuses connections",
+                    config.FAULT_MEMORY: f"is squeezed into {mem} MB", config.FAULT_DISK: "has a full scratch disk"}[fault]
+            short = {config.FAULT_PAUSE: "hang", config.FAULT_STOP: "stop", config.FAULT_LATENCY: "latency",
+                     config.FAULT_LOSS: "packet loss", config.FAULT_CPU: "CPU starvation",
+                     config.FAULT_REFUSE: "connection failures", config.FAULT_MEMORY: "memory exhaustion",
+                     config.FAULT_DISK: "disk full"}[fault]
             recs.append((score, {
-                "rank": 1, "name": f"{target} {'hang' if fault == config.FAULT_PAUSE else 'latency'}",
+                "rank": 1, "name": f"{target} {short}",
                 "fault_type": fault, "target": target, "duration_s": DEFAULT_DURATION_S, "latency_ms": lat,
+                "loss_pct": loss, "cpu_limit": cpu, "memory_mb": mem,
                 "abort_max_error_rate": DEFAULT_ABORT_ERROR_RATE,
                 "abort_max_p95_latency_ms": DEFAULT_ABORT_P95_MS,
                 "hypothesis": (f"When {target} {verb}, only workflows that need {target} "
@@ -208,9 +232,9 @@ def rules_plan(context: dict) -> dict:
                                "recovers within 30s of fault removal without intervention.")[:400],
                 "rationale": (f"{len(flows)} of {len(catalog.WORKFLOWS)} workflows are expected to pass through "
                               f"{target} (criticality reach {reach:.2f}); {why}. Priority score {score:.2f}."),
-                "expected_effects": [f"{w}: errors or timeouts" if fault == config.FAULT_PAUSE
-                                     else f"{w}: higher latency" for w in flows],
-                "dependencies": ["webserver", target], "workflows": flows,
+                "expected_effects": [f"{w}: errors or timeouts" if fault in (config.FAULT_PAUSE, config.FAULT_STOP)
+                                     else f"{w}: higher latency or timeouts" for w in flows],
+                "dependencies": sorted({"webserver", target}), "workflows": flows,
                 "risks": ["automatic abort may truncate the fault window before slower effects appear"],
             }))
     recs.sort(key=lambda x: -x[0])
@@ -235,7 +259,7 @@ def make_plan(store: Store, graph: dict, provider: Optional[Provider],
                 raw = provider.complete_json(SYSTEM, user + feedback)
                 accepted, rejected = validate_plan(raw, graph, limits)
                 if accepted:
-                    source.update(mode="llm", error=None)
+                    source.update(mode="llm", error=None, model=getattr(provider, "last_model", source.get("model")))
                     break
                 source["error"] = "no recommendation passed validation"
                 feedback = ("\n\nYour previous reply was rejected: "

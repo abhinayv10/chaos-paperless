@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Optional, Protocol
 
 import httpx
@@ -24,6 +25,8 @@ ANTHROPIC_MODEL = os.environ.get("CHAOS_ANTHROPIC_MODEL", "claude-opus-5-5")
 OPENAI_URL = os.environ.get("CHAOS_OPENAI_URL", "https://api.openai.com/v1")
 OPENAI_MODEL = os.environ.get("CHAOS_OPENAI_MODEL", "")
 LLM_TIMEOUT_S = float(os.environ.get("CHAOS_LLM_TIMEOUT_S", "180"))
+RETRY_STATUS = {429, 500, 502, 503, 504}
+RETRY_DELAY_S = 2.0
 
 
 class LLMError(Exception):
@@ -84,16 +87,28 @@ class OpenAICompatibleProvider:
                  timeout: float = LLM_TIMEOUT_S):
         self.model, self.url, self.timeout = model, url.rstrip("/"), timeout
         self.api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", "")
+        self.fallbacks = [m.strip() for m in os.environ.get("CHAOS_OPENAI_FALLBACK_MODELS", "").split(",") if m.strip()]
+        self.last_model = model
 
     def complete_json(self, system: str, user: str) -> dict:
         if not self.model:
             raise LLMError("openai: set CHAOS_OPENAI_MODEL")
         try:
-            r = httpx.post(f"{self.url}/chat/completions", timeout=self.timeout,
-                           headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
-                           json={"model": self.model, "response_format": {"type": "json_object"},
-                                 "messages": [{"role": "system", "content": system},
-                                              {"role": "user", "content": user}]})
+            # hosted models shed load with 429/503: one short retry, then the
+            # fallback models (CHAOS_OPENAI_FALLBACK_MODELS) before giving up
+            attempts = [self.model, self.model] + [m for m in self.fallbacks if m != self.model]
+            for i, model in enumerate(attempts):
+                r = httpx.post(f"{self.url}/chat/completions", timeout=self.timeout,
+                               headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
+                               json={"model": model, "response_format": {"type": "json_object"},
+                                     "messages": [{"role": "system", "content": system},
+                                                  {"role": "user", "content": user}]})
+                if r.status_code in RETRY_STATUS and i < len(attempts) - 1:
+                    if i == 0:
+                        time.sleep(RETRY_DELAY_S)
+                    continue
+                self.last_model = model
+                break
             r.raise_for_status()
             return extract_json(r.json()["choices"][0]["message"]["content"])
         except LLMError:

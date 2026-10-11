@@ -7,7 +7,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import FAULT_LATENCY, FAULT_PAUSE
+from .config import (FAULT_CPU, FAULT_DISK, FAULT_LATENCY, FAULT_LOSS, FAULT_MEMORY, FAULT_PAUSE,
+                     FAULT_REFUSE, FAULT_STOP)
 
 
 class Thresholds(BaseModel):
@@ -30,12 +31,21 @@ class ExperimentConfig(BaseModel):
 
     name: str = Field("experiment", min_length=1, max_length=80)
     hypothesis: str = Field("", max_length=400)
-    fault_type: Literal["dependency_pause", "network_latency"] = FAULT_PAUSE
+    fault_type: Literal["dependency_pause", "dependency_stop", "network_latency", "packet_loss",
+                        "cpu_exhaustion", "connection_refused", "memory_exhaustion",
+                        "disk_exhaustion"] = FAULT_PAUSE
     target: str = Field(..., pattern=r"^[a-z0-9][a-z0-9_-]{0,40}$")
     duration_s: int = Field(30, ge=1)
     latency_ms: Optional[int] = Field(None, ge=1)
+    loss_pct: Optional[int] = Field(None, ge=1)
+    cpu_limit: Optional[float] = Field(None, gt=0)
+    memory_mb: Optional[int] = Field(None, ge=1)
     thresholds: Thresholds = Field(default_factory=Thresholds)
     recovery_timeout_s: int = Field(90, ge=5)
+    # "engine": thresholds abort and the engine rolls back (Day 1/2 behaviour).
+    # "agent": the fault is held (still bounded by duration, watchdog and kill
+    # switch) so the self-healing agent can detect and fix it on its own.
+    remediation: Literal["engine", "agent"] = "engine"
 
 
 class RunState(str, Enum):
@@ -88,4 +98,10 @@ class Check:
 FAULT_LABELS = {
     FAULT_PAUSE: "Dependency pause (docker pause / unpause)",
     FAULT_LATENCY: "Network latency (tc netem on target egress)",
+    FAULT_STOP: "Dependency stop (docker stop / start)",
+    FAULT_LOSS: "Packet loss (tc netem loss on target egress)",
+    FAULT_CPU: "CPU exhaustion (docker update --cpu-quota / restore)",
+    FAULT_REFUSE: "Connection failures (iptables rejects connections to the service port)",
+    FAULT_MEMORY: "Memory exhaustion (tight docker memory limit / recreate)",
+    FAULT_DISK: "Disk exhaustion (fill the bounded scratch volume / free it)",
 }

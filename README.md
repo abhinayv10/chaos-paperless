@@ -26,6 +26,12 @@ On top of that engine sits a closed loop with two AI agents (sections 3 and 6):
 
 The agents only propose and interpret. They cannot run commands, touch Docker or change the application.
 
+**Self-healing mode** (section 3, "Self-healing agent") adds a LangGraph agent that watches each experiment
+without being told what was injected. It detects the failure from metric anomalies (statistics), asks the AI
+model to name the failure class and cite the anomalies behind every reasoning step, then applies the
+**predetermined runbook** that a fixed rule table assigns to that class, and verifies the fix. The AI never
+chooses or performs the fix.
+
 ---
 
 ## 1. Prerequisites
@@ -79,23 +85,25 @@ CLI `run`.
 
 ### AI-driven loop
 
-The dashboard (http://127.0.0.1:8800) shows the same loop in three sections:
+The dashboard (http://127.0.0.1:8800) has two pages:
 
-- **Overview**: a headline status (Ready, Running, Fault active, Recovering, Recovered, Failed, Blocked) with one
-  sentence saying what happened, the resilience score, and a five-step strip for the current or latest experiment:
-  baseline, fault injected, impact observed, rolled back, recovered. Below it are the dependency map, the effect on
-  each user workflow before, during and after the fault, and the response-time chart.
-- **Experiments**: the same five-step strip, then the ranked plan with what each experiment is expected to affect
-  and why it has that rank, one button to approve and run the selected ones, and each completed experiment's
-  impact, severity and recovery. Run history and the manual experiment form are in collapsed sections below.
-- **Findings**: the score with its three components, a worst-first table of the weaknesses found, and one card per
-  weakness: what broke (measured), the likely cause, and the recommended fix, with the evidence one click away.
+- **Overview**: the website itself. A status bar (overall state, each component with its uptime, the upload disk, and
+  the resilience score), six live metrics with 15-minute trends (requests per minute, error rate, median response,
+  documents stored, upload-to-processed time, task queue), CPU and memory per container from Docker, the dependency
+  map, the effect of the latest experiment on each user workflow before / during / after, and its response-time chart.
+- **Scan & inject**: the whole campaign. The scan log, the weak points ranked by the AI, the experiments with what
+  each tests and when it runs (approve here), the live view of the running experiment with the self-healing agent's
+  full detail (detection moments, measured anomalies, AI diagnosis with cited signals, runbook, verification), and
+  a findings table: one row per weak point with its verdict, what happened, how self-healing did and the fix.
+
+The CLI commands below (planner, plan-run, analyse, report) still work; the dashboard drives everything through the
+campaign.
 
 The dashboard uses plain names: `db` is shown as "database", `broker` as "message broker", and the probes as the
 workflows they stand for ("List documents" for `api_documents`, and so on).
 
 "Recovered" is shown only once the controller has verified recovery. Output from the rules fallback is labelled as
-rule-based, with a notice on the plan and on the findings, and the top bar shows whether an LLM is configured.
+rule-based, and the top bar shows which AI model is in use.
 
 ```powershell
 .venv\Scripts\python -m chaos plan                  # Agent 1: ranked experiments with hypothesis and reasons
@@ -126,6 +134,90 @@ You can also pass `--provider` to `plan`, `plan-run`, `analyze` and `retest`. Wi
 fails or returns something invalid, both agents fall back to deterministic rules. Their output is then labelled
 `rules` or `rules-fallback` (with the provider's error) everywhere it appears, so it is never mistaken for an AI
 diagnosis. Measurements, classification and scores do not depend on the provider at all.
+
+**Gemini.** Google's OpenAI-compatible endpoint works with the `openai` provider. Save your key once as a Windows user
+variable (`[Environment]::SetEnvironmentVariable('GEMINI_API_KEY', '<key>', 'User')`), then start the dashboard with
+`.\serve-gemini.ps1` instead of `python -m chaos serve`. It reads the key from that variable and defaults to
+`gemini-3.5-flash` (override with `CHAOS_OPENAI_MODEL`). In testing, newer Flash models often returned HTTP 503 on the
+free tier. The `openai` provider retries once after 2 s on 429/5xx before falling back to rules.
+
+### Chaos campaign: scan, AI selection, your confirmation, injection
+
+The **Scan & inject** tab runs the whole loop as one LangGraph graph (`campaign.py`):
+
+```
+scan -> rank (AI) -> select (AI + safety policy) -> confirm (you) -> inject (agent + tool) -> ... -> report
+```
+
+1. **Resilience scan** (`scanner.py`, read-only, streamed live): discovers the architecture, sends live requests to
+   every workflow, inspects replicas, restart policies, health checks and CPU limits, checks the application's timeout
+   settings and latency headroom, and looks for circuit breakers. Each weak point is a finding with its measured
+   evidence and the experiments that would test it.
+2. **Rank and select (AI).** The model ranks every finding with a rationale and proposes 3 to 5 experiments. Each must
+   come from the tests the scan suggested for that finding and pass the safety policy; anything else is rejected and
+   listed. Rules take over if the model is unavailable.
+3. **Confirm (you).** The graph pauses (a LangGraph interrupt) until you approve at least 3 in the dashboard. Nothing is
+   injected before that. You can uncheck experiments or cancel.
+4. **Inject (agent + tool).** An execution agent calls the `inject_fault` tool (a LangChain structured tool) for the next
+   approved experiment. The tool refuses any call that does not match an approved experiment exactly, so the AI cannot
+   change what you approved. Each run goes through the engine's full safety path and is resolved by the self-healing
+   agent; the analyst then diagnoses it.
+5. **Report.** Before / during / after error rate and p95, the agent's detection, diagnosis (graded) and fix times,
+   the analyst's impact, severity and recommended fix, a measured **circuit-breaker check** (do failures get faster as
+   an outage goes on, or does every request keep waiting for its timeout?), and whether each weak point was confirmed.
+
+API: `POST /api/campaign`, `GET /api/campaign/latest`, `POST /api/campaign/{id}/confirm {"approved": ["E1","E2","E3"]}`,
+`POST /api/campaign/{id}/cancel`.
+
+### Fault catalogue
+
+| Fault | Parameter | Injection | Removal (also by the self-healing runbook) |
+|---|---|---|---|
+| `dependency_pause` | - | `docker pause` | `docker unpause` |
+| `dependency_stop` | - | `docker stop` (restart policy `unless-stopped` keeps it down) | `docker start` |
+| `network_latency` | `latency_ms` 10-3000 | netem sidecar `delay` | remove sidecar + `tc qdisc del` |
+| `packet_loss` | `loss_pct` 1-60 | netem sidecar `loss` | remove sidecar + `tc qdisc del` |
+| `cpu_exhaustion` | `cpu_limit` 0.02-0.5 CPUs | `docker update --cpu-period/--cpu-quota` | `docker update --cpu-quota -1` |
+| `connection_refused` | - | iptables sidecar rejects every TCP packet to the service port (5432 / 6379) | remove sidecar + delete the `CHAOS` chain |
+| `memory_exhaustion` | `memory_mb` 6-256 | `docker update --memory/--memory-swap` below the working set (OOM kills) | recreate the container from its compose definition (Docker cannot lift a memory limit) |
+| `disk_exhaustion` | - | fill Paperless' 64 MB tmpfs upload scratch volume (`paperless-chaos_scratch`) | delete the fill file |
+
+`db` and `broker` allow the first seven. The webserver is never disturbed itself; its only permitted fault is
+filling its bounded scratch volume, which lives in memory and can never touch the host disk. Every fault is covered
+by the watchdog, the kill switch and the emergency sweep, and every one has a self-healing runbook (RB-1 to RB-11).
+The campaign proposes an experiment for **every** weak point the scan finds; one experiment can cover several.
+
+### Self-healing agent
+
+With **self-healing mode** on (the default for `serve`; toggle it on the **Self-healing** tab or with
+`POST /api/agent {"enabled": false}`), every experiment you start is handed to a LangGraph agent (`healer.py`):
+
+```
+observe -> detect --(anomalies confirmed)--> diagnose -> select_runbook -> remediate -> verify -> close
+   ^         | healthy                          ^                                         |
+   +---------+                                  +------ not fixed: exclude class, retry --+  (max 2, then escalate)
+```
+
+| Step | Decided by | What happens |
+|---|---|---|
+| observe | - | Reads probe results (by timestamp) and container states. It learns a healthy baseline from the first 12 s. It is given only the run id: never the fault type, the target or the injection time. |
+| detect | statistics (`detection.py`) | Over the last 15 s, a workflow is anomalous when its error rate is >= 50% and >= 40 points above normal (>= 2 failures), or its successful-request p95 is >= 2.5x normal and >= 800 ms slower. A paused or unhealthy container and Paperless' own status report ("redis=ERROR") are signals too. An incident opens when anomalies persist on 2 consecutive checks. Each anomaly becomes a numbered signal (A1, A2, ...), and what is still normal becomes N1, N2, ... |
+| diagnose | **AI** (rules if it fails) | The model receives the signals and which service each workflow needs, and must pick one class: `db_unavailable`, `db_slow`, `broker_unavailable`, `broker_slow` or `unknown`. Every reasoning step must cite signal ids. Answers citing ids that do not exist, uncited steps, extra fields or classes outside the list are rejected (one retry). A rules classifier runs on the same signals as a fallback and a cross-check. |
+| select_runbook | **fixed rule table** (`runbooks.py`) | `db_unavailable` -> RB-1 unpause the database; `broker_unavailable` -> RB-2 unpause the broker; `db_slow` -> RB-3 remove traffic shaping from the database; `broker_slow` -> RB-4 the same for the broker; `unknown` -> RB-0 escalate, change nothing. |
+| remediate | the runbook | Its single fixed action, through `docker_ops` on an allowlisted sandbox service only. |
+| verify | checks | The target condition must be gone and the application must answer normally again within 30 s. If not, that class is excluded and the agent diagnoses again. |
+
+In self-healing mode the engine holds the fault instead of aborting on thresholds (breaches are still recorded), so
+the agent has something to fix. Faults are held for up to 90 s. The engine's safety net still applies: the
+planned-end removal, the independent watchdog and the kill switch. When the agent reports a fix, the engine checks
+the real fault state itself before accepting it, so "fault removed by the agent" is not the agent's own claim.
+Afterwards the API grades the incident against what was actually injected: correct class, time to detect, fix and
+recover, and who removed the fault.
+
+The **Self-healing** tab shows the live graph, the anomaly table (normal value, observed value, change, and the rule
+that fired), the diagnosis with each reasoning step's cited signals (hover a citation to highlight the measurement),
+the alternatives it ruled out, the runbook and its steps, verification, grading and a response-time chart with the
+detection, fix and verification marked.
 
 ## 4. Shutdown and reset
 
@@ -160,6 +252,10 @@ Remove-Item -Recurse data                      # wipes recorded experiments (opt
  │ scoring.py      deterministic severity and resilience scores      │
  │ analyst.py      Agent 2: diagnosis grounded in numbered facts     │
  │ llm.py          provider interface (Ollama / Anthropic / OpenAI)  │
+ │ ── self-healing (detects and fixes; AI only names the class) ──── │
+ │ detection.py    blind anomaly detection, numbered signals, rules  │
+ │ healer.py       LangGraph agent: observe→detect→diagnose→...      │
+ │ runbooks.py     fixed rule table + allowlisted fix actions        │
  └───────────────┬────────────────────────────────────┬──────────────┘
                  │ docker CLI (sandbox-only)          │ HTTP (real Paperless API)
                  ▼                                    ▼
@@ -319,6 +415,11 @@ app the same way pausing the real one does. They cover:
 - severity and resilience maths, the unrecovered floor and cap, coverage, and weak reruns not replacing results
 - sequencing: completion, stop on BLOCKED, rejection and kill switch, and AI failure not affecting rollback
 - evidence records, JSON export, the Day 2 API and the findings report
+- self-healing: anomaly detection (errors vs timeouts vs slowness, one-off blips ignored), the rules classifier,
+  the AI diagnosis contract (non-existent or missing citations, excluded classes, extra fields), every runbook
+  including the refusal of non-allowlisted services, and the full graph against the fake sandbox: a correct fix,
+  a wrong first diagnosis caught by verification and retried, an AI outage falling back to rules, escalation
+  with the engine's deadline still removing the fault, and a test that fails if the agent reads the run's config
 
 ## 8. Troubleshooting
 
@@ -350,6 +451,10 @@ app the same way pausing the real one does. They cover:
   and to flag surprises.
 - When thresholds abort a run after a few seconds, each workflow may have a single fault-phase sample. The finding
   lists this, and its confidence is lowered.
+- The self-healing agent knows four failure classes, matching the four injectable faults. Its runbooks undo those
+  faults (unpause, clear traffic shaping); real incidents would need runbooks such as restart or failover.
+- Detection relies on the synthetic workload, so it needs traffic; with a slow sandbox (probe p95 near the 5 s
+  timeout) the baseline itself contains timeouts, which raises the bar for an anomaly.
 - The rules fallback produces template diagnoses chosen by fault type. They are labelled as such and are weaker than
   a model reading the evidence.
 - Recommended fixes are not applied or verified automatically. `retest` compares before and after once you have

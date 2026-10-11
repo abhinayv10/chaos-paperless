@@ -6,7 +6,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from chaos import analyst, api as api_mod, catalog, pipeline, planner, scoring
+from chaos import analyst, api as api_mod, catalog, config, pipeline, planner, scoring
 from chaos.analysis import analyze_run
 from chaos.discovery import build_graph, load_compose
 from chaos.engine import Engine
@@ -123,13 +123,13 @@ def test_planner_accepts_valid_llm_plan_and_keeps_its_ranking(store, docker):
     assert store.get_plan(plan["id"])["recommendations"][0]["latency_ms"] == 200
     system, user = prov.calls[0]
     ctx = json.loads(user.split("\n", 1)[1])
-    assert {c["fault_type"] for c in ctx["capabilities"]} == {"dependency_pause", "network_latency"}
+    assert {c["fault_type"] for c in ctx["capabilities"]} == set(config.ALL_FAULTS)
     assert {s["id"] for s in ctx["dependency_map"]["services"]} >= {"webserver", "db", "broker"}
     assert any(e["from"] == "webserver" and e["to"] == "db" for e in ctx["dependency_map"]["edges"])
 
 
 @pytest.mark.parametrize("bad, needle", [
-    (rec(target="webserver"), "not an approved"),
+    (rec(target="webserver"), "not permitted on 'webserver'"),
     (rec(target="host"), "not an approved"),
     (rec(duration_s=9999), "duration"),
     (rec(fault_type="network_latency", latency_ms=99999), "latency"),
@@ -176,7 +176,7 @@ def test_planner_falls_back_to_rules_when_provider_fails_or_misbehaves(store, do
     assert plan["source"]["mode"] == "rules-fallback" and plan["source"]["error"]
     assert len(plan["recommendations"]) == len(catalog.scenarios())
     for r in plan["recommendations"]:  # every fallback item passes the engine's own policy
-        assert planner.to_config(r).target in ("db", "broker")
+        assert planner.to_config(r).target in ("db", "broker", "webserver")
     assert store.latest_plan()["id"] == plan["id"]
 
 
@@ -184,7 +184,7 @@ def test_planner_retries_once_with_the_validation_errors(store, docker):
     prov = FakeProvider({"recommendations": [rec(target="webserver")]}, {"recommendations": [rec()]})
     plan = planner.make_plan(store, graph_of(docker), prov, TEST_LIMITS)
     assert plan["source"]["mode"] == "llm" and plan["source"]["attempts"] == 2
-    assert "not an approved" in prov.calls[1][1]
+    assert "not permitted on 'webserver'" in prov.calls[1][1]
 
 
 def test_rules_ranking_uses_architecture_and_previous_results(store, docker):
@@ -421,10 +421,11 @@ def test_overall_reports_coverage_and_ignores_weak_reruns(store, docker):
     for rid in ("c-1", "c-2", "c-3"):
         analyst.analyze(store, rid, g, None)
     o = pipeline.findings_summary(store)["overall"]
-    assert o["scenarios_scored"] == 1 and o["scenarios_total"] == 4 and o["coverage"] == 0.25
+    n = len(catalog.scenarios())
+    assert o["scenarios_scored"] == 1 and o["scenarios_total"] == n and o["coverage"] == round(1 / n, 3)
     assert o["per_scenario"][0]["run_id"] == "c-1", "weak reruns must not replace a scored result"
     assert o["counts"] == {"completed": 1, "aborted": 1, "inconclusive": 1, "unrecovered": 0}
-    assert o["experiments_analysed"] == 3 and len(o["untested_scenarios"]) == 3
+    assert o["experiments_analysed"] == 3 and len(o["untested_scenarios"]) == n - 1
     assert o["score"] == store.get_analysis("c-1")["resilience"]["score"]
     # a proper rerun does replace it
     synth_run(store, "c-4", HEALTHY, HEALTHY, fault_type="dependency_pause", created=4.0)
@@ -494,7 +495,7 @@ def test_sequence_revalidates_each_item_and_stops_on_rejection(engine, store, do
     store.save_plan(plan)
     ex = orchestrator(engine, store, docker, tmp_path).run_sequence(plan["id"])
     assert ex["status"] == "stopped" and "rejected by safety checks" in ex["stop_reason"]
-    assert ex["steps"][0]["state"] == "rejected" and "not an approved" in ex["steps"][0]["errors"][0]
+    assert ex["steps"][0]["state"] == "rejected" and "not permitted on 'webserver'" in ex["steps"][0]["errors"][0]
     assert not [c for c in docker.calls if c[0] == "pause"]
 
 
@@ -580,7 +581,7 @@ def test_findings_report_separates_plan_execution_facts_and_hypotheses(engine, s
         assert section in text
     assert "-> executed as exp-" in text and "-> planned" in text  # rank 2 was planned, never run
     assert "[rules] hypothesis 1" in text and "[rules] fix [timeout_configuration]" in text
-    assert "webserver -> db" in text and "1 of 4 catalogue scenarios scored" in text
+    assert "webserver -> db" in text and f"1 of {len(catalog.scenarios())} catalogue scenarios scored" in text
     assert "SEVERITY of one experiment" in text
     empty = format_findings_report(None, [], scoring.overall([], catalog.scenarios()), {})
     assert "No plan has been generated" in empty and "Score: n/a" in empty
@@ -593,7 +594,7 @@ def test_api_plan_run_analyse_findings_report_and_export(store, docker, engine):
         assert c.get("/api/ai/status").json()["provider"] is None
         assert c.get("/api/plan").json()["plan"] is None
         plan = c.post("/api/plan").json()
-        assert plan["source"]["mode"] == "rules" and len(plan["recommendations"]) == 4
+        assert plan["source"]["mode"] == "rules" and len(plan["recommendations"]) == len(catalog.scenarios())
         assert c.post("/api/plan/nope/run", json={}).status_code == 404
         assert c.post(f"/api/plan/{plan['id']}/run", json={"ranks": [99]}).status_code == 400
         assert c.post(f"/api/plan/{plan['id']}/run", json={"ranks": [1], "cmd": "x"}).status_code == 422

@@ -263,7 +263,7 @@ def analyze(store: Store, run_id: str, graph: dict, provider: Optional[Provider]
             source["attempts"] = attempt
             try:
                 diagnosis = validate_diagnosis(provider.complete_json(SYSTEM, user + feedback), det, nodes)
-                source.update(mode="llm", error=None)
+                source.update(mode="llm", error=None, model=getattr(provider, "last_model", source.get("model")))
                 break
             except LLMError as e:
                 source["error"] = str(e)
